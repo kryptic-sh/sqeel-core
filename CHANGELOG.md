@@ -22,8 +22,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
   missing — returns bundled defaults in memory instead. Use
   `hjkl_config::write_default` explicitly if a starter file is needed.
 - `load_main_config` now validates the merged config and returns an error if
-  `editor.lsp_binary` is empty, `editor.mouse_scroll_lines` is `0`, or
-  `editor.leader_key` is not exactly one character.
+  `editor.lsp_binary` is empty or `editor.mouse_scroll_lines` is `0`. Multi-char
+  or empty `leader_key` values are caught at parse time by serde's `char`
+  deserializer (see breaking change below).
+- **Breaking:** `EditorConfig::leader_key` is now `char` (was `String`). Made
+  the invariant unrepresentable at the type level — TOML strings of length != 1
+  fail to deserialize with a span-aware error from hjkl-config. Existing user
+  files keep working: `leader_key = " "` still parses (a single space is a valid
+  `char`). Multi-char strings like `"ab"` now fail at parse time rather than
+  being silently truncated or surfaced via a runtime validation message.
+- **Path migration on macOS/Windows:** `config_dir()` now routes through
+  `hjkl_config::config_dir::<MainConfig>()` instead of a hand-rolled
+  `dirs::config_dir().join("sqeel")`. Linux paths are unchanged
+  (`~/.config/sqeel/`). macOS moves from `~/Library/Application Support/sqeel/`
+  to `~/Library/Application Support/sh.kryptic.sqeel/`; Windows moves from
+  `%APPDATA%\sqeel\` to `%APPDATA%\kryptic\sqeel\config\`. Existing
+  macOS/Windows users will need to move their `config.toml`, `conns/`, and
+  `session.toml` to the new location. The application name now lives in exactly
+  one place: `AppConfig::APPLICATION = "sqeel"` on `MainConfig`. Sandbox
+  override (`set_config_dir_override`) for `--sandbox` is preserved.
 
 ### Added
 
@@ -34,8 +51,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   helpers so error messages carry field names.
 - `pub const DEFAULTS_TOML: &str` — exposes the bundled defaults string for
   downstream tooling.
-- 8 new tests covering bundled-defaults parse, partial user overrides preserving
-  defaults, unknown-key rejection, and validation boundaries.
+- 11 new tests covering bundled-defaults parse, partial user overrides
+  preserving defaults, unknown-key rejection, validation boundaries (empty
+  `lsp_binary`, zero `mouse_scroll_lines`), and parse-level rejection of
+  multi-char / empty / unicode-single-char `leader_key`.
 
 ## [0.2.3] - 2026-05-03
 

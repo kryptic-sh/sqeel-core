@@ -19,7 +19,7 @@ pub struct EditorConfig {
     pub keybindings: KeybindingMode,
     pub lsp_binary: String,
     pub mouse_scroll_lines: usize,
-    pub leader_key: String,
+    pub leader_key: char,
     /// Whether `Ctrl+Shift+Enter` (run-all) stops on the first query error.
     pub stop_on_error: bool,
     /// Seconds before cached schema data (databases / tables / columns) is
@@ -46,15 +46,10 @@ impl Validate for MainConfig {
     fn validate(&self) -> Result<(), Self::Error> {
         ensure_non_empty_str(&self.editor.lsp_binary, "editor.lsp_binary")?;
         ensure_non_zero(self.editor.mouse_scroll_lines, "editor.mouse_scroll_lines")?;
-        // leader_key is a String for back-compat, but must be exactly one char.
-        // Multi-char (or empty) leaders can't be matched against a key event.
-        let leader_chars = self.editor.leader_key.chars().count();
-        if leader_chars != 1 {
-            return Err(ValidationError::new(
-                "editor.leader_key",
-                format!("must be a single character, got {leader_chars} chars"),
-            ));
-        }
+        // leader_key is a `char` — multi-char and empty leaders are
+        // already rejected at parse time by serde's char deserializer
+        // (TOML strings of length != 1 fail to convert to `char`). No
+        // additional validation needed here.
         Ok(())
     }
 }
@@ -142,7 +137,8 @@ pub struct SessionData {
 
 /// Process-wide override for the config dir, set by `--sandbox` so
 /// dev-mode runs don't touch the user's real `~/.config/sqeel/`.
-/// `None` (the default) falls back to `dirs::config_dir()`.
+/// `None` (the default) falls back to [`hjkl_config::config_dir`] keyed
+/// off the [`AppConfig`] impl on [`MainConfig`].
 static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Install a sandbox config dir. Idempotent — first call wins.
@@ -152,11 +148,20 @@ pub fn set_config_dir_override(path: PathBuf) {
     let _ = CONFIG_DIR_OVERRIDE.set(path);
 }
 
+/// Resolve the sqeel config root. Sandbox override (set via
+/// [`set_config_dir_override`] from `--sandbox`) wins; otherwise routes
+/// through [`hjkl_config::config_dir`] using
+/// [`MainConfig`]'s [`AppConfig`] impl, so the application name lives in
+/// exactly one place (the trait constant). Per-platform paths:
+///
+/// - Linux: `$XDG_CONFIG_HOME/sqeel` (default `~/.config/sqeel`)
+/// - macOS: `~/Library/Application Support/sh.kryptic.sqeel`
+/// - Windows: `%APPDATA%\kryptic\sqeel\config`
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(p) = CONFIG_DIR_OVERRIDE.get() {
         return Some(p.clone());
     }
-    dirs::config_dir().map(|d| d.join("sqeel"))
+    hjkl_config::config_dir::<MainConfig>().ok()
 }
 
 /// Load + validate `MainConfig`.
@@ -165,8 +170,9 @@ pub fn config_dir() -> Option<PathBuf> {
 /// file at `<config_dir>/config.toml` is **deep-merged** on top
 /// (only overridden fields need to appear there). Unknown keys are
 /// rejected. Validation is run on the merged result and surfaces
-/// out-of-range values (empty `lsp_binary`, zero `mouse_scroll_lines`,
-/// non-single-char `leader_key`).
+/// out-of-range values (empty `lsp_binary`, zero `mouse_scroll_lines`).
+/// Multi-char or empty `leader_key` is caught at parse time by serde's
+/// `char` deserializer (TOML strings of length != 1 fail to convert).
 ///
 /// Missing user file → bundled defaults only. **Never writes to disk** —
 /// callers that want to scaffold a starter config can use
@@ -332,7 +338,7 @@ mod tests {
         assert_eq!(cfg.editor.keybindings, KeybindingMode::Vim);
         assert_eq!(cfg.editor.lsp_binary, "sqls");
         assert_eq!(cfg.editor.mouse_scroll_lines, 3);
-        assert_eq!(cfg.editor.leader_key, " ");
+        assert_eq!(cfg.editor.leader_key, ' ');
         assert!(cfg.editor.stop_on_error);
         assert_eq!(cfg.editor.schema_ttl_secs, 300);
     }
@@ -381,7 +387,7 @@ mod tests {
         assert_eq!(cfg.editor.mouse_scroll_lines, 5);
         // Non-overridden fields retain bundled values:
         assert_eq!(cfg.editor.keybindings, KeybindingMode::Vim);
-        assert_eq!(cfg.editor.leader_key, " ");
+        assert_eq!(cfg.editor.leader_key, ' ');
         assert!(cfg.editor.stop_on_error);
         assert_eq!(cfg.editor.schema_ttl_secs, 300);
     }
@@ -411,29 +417,33 @@ mod tests {
         assert_eq!(err.field, "editor.lsp_binary");
     }
 
+    /// Multi-char leader strings must be rejected at parse time — serde's
+    /// `char` deserializer fails on TOML strings of length != 1. This
+    /// pins the contract: users who write `leader_key = "ab"` get a
+    /// `ConfigError::Invalid` instead of a silently truncated leader.
     #[test]
-    fn validate_rejects_multi_char_leader_key() {
-        let mut cfg = MainConfig::default();
-        cfg.editor.leader_key = "ab".into();
-        let err = cfg.validate().unwrap_err();
-        assert_eq!(err.field, "editor.leader_key");
-        assert!(err.message.contains("2 chars"));
+    fn parse_rejects_multi_char_leader_key() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[editor]\nleader_key = \"ab\"").unwrap();
+        let err = hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
+        assert!(matches!(err, hjkl_config::ConfigError::Invalid { .. }));
     }
 
     #[test]
-    fn validate_rejects_empty_leader_key() {
-        let mut cfg = MainConfig::default();
-        cfg.editor.leader_key = String::new();
-        let err = cfg.validate().unwrap_err();
-        assert_eq!(err.field, "editor.leader_key");
-        assert!(err.message.contains("0 chars"));
+    fn parse_rejects_empty_leader_key() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[editor]\nleader_key = \"\"").unwrap();
+        let err = hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
+        assert!(matches!(err, hjkl_config::ConfigError::Invalid { .. }));
     }
 
     #[test]
-    fn validate_accepts_unicode_single_char_leader_key() {
-        let mut cfg = MainConfig::default();
-        cfg.editor.leader_key = "α".into();
-        assert!(cfg.validate().is_ok());
+    fn parse_accepts_unicode_single_char_leader_key() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[editor]\nleader_key = \"α\"").unwrap();
+        let cfg: MainConfig =
+            hjkl_config::load_layered_from(DEFAULTS_TOML, f.path()).unwrap();
+        assert_eq!(cfg.editor.leader_key, 'α');
     }
 
     #[test]
