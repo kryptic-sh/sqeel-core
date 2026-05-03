@@ -423,7 +423,8 @@ mod tests {
     fn parse_rejects_multi_char_leader_key() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "[editor]\nleader_key = \"ab\"").unwrap();
-        let err = hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
+        let err =
+            hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
         assert!(matches!(err, hjkl_config::ConfigError::Invalid { .. }));
     }
 
@@ -431,7 +432,8 @@ mod tests {
     fn parse_rejects_empty_leader_key() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "[editor]\nleader_key = \"\"").unwrap();
-        let err = hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
+        let err =
+            hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
         assert!(matches!(err, hjkl_config::ConfigError::Invalid { .. }));
     }
 
@@ -439,8 +441,7 @@ mod tests {
     fn parse_accepts_unicode_single_char_leader_key() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "[editor]\nleader_key = \"α\"").unwrap();
-        let cfg: MainConfig =
-            hjkl_config::load_layered_from(DEFAULTS_TOML, f.path()).unwrap();
+        let cfg: MainConfig = hjkl_config::load_layered_from(DEFAULTS_TOML, f.path()).unwrap();
         assert_eq!(cfg.editor.leader_key, 'α');
     }
 
