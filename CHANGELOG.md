@@ -6,8 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-03
+
 ### Changed
 
+- **`hjkl-bonsai` 0.2 → 0.3.** Grammar storage subdir renamed `hjkl/` →
+  `bonsai/`, and macOS/Windows now follow XDG-everywhere instead of
+  `~/Library/Application Support` / `%APPDATA%`. Existing grammars under the old
+  paths are not migrated — sqeel re-fetches and re-compiles them into the new
+  `~/.local/share/bonsai/grammars/` location on first use.
 - **Config loading migrated to `hjkl-config` 0.2.** Defaults now live in
   `crates/sqeel-core/src/config.toml`, bundled via `include_str!()` and parsed
   at runtime as the single source of truth. The user file at
@@ -98,7 +105,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.3.0
 [0.2.3]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.2.3
 [0.2.2]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.2.2
 [0.2.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.2.1
