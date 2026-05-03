@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Config loading migrated to `hjkl-config` 0.1.** Defaults now live in
+  `crates/sqeel-core/src/config.toml`, bundled via `include_str!()` and parsed
+  at runtime as the single source of truth. The user file at
+  `<config_dir>/config.toml` is **deep-merged** on top via
+  `hjkl_config::load_layered_from` — only the fields you want to override need
+  to appear there. Unknown keys are an error.
+- Dropped `DEFAULT_CONFIG` const, `default_*` helper fns, and per-field
+  `#[serde(default = "...")]` attrs (no default values live in Rust code
+  anymore). `MainConfig::default()` parses the bundled TOML.
+- `MainConfig` and `EditorConfig` are now `#[serde(deny_unknown_fields)]`.
+- `load_main_config` no longer auto-writes a default config file when one is
+  missing — returns bundled defaults in memory instead. Use
+  `hjkl_config::write_default` explicitly if a starter file is needed.
+- `load_main_config` now validates the merged config and returns an error if
+  `editor.lsp_binary` is empty, `editor.mouse_scroll_lines` is `0`, or
+  `editor.leader_key` is not exactly one character.
+
+### Added
+
+- `hjkl-config = "0.1"` dependency.
+- `MainConfig` impls `hjkl_config::AppConfig` (`APPLICATION = "sqeel"`) and
+  `hjkl_config::Validate` (with `ValidationError` as the associated error). The
+  `Validate` hook composes the shared `ensure_non_empty_str` / `ensure_non_zero`
+  helpers so error messages carry field names.
+- `pub const DEFAULTS_TOML: &str` — exposes the bundled defaults string for
+  downstream tooling.
+- 8 new tests covering bundled-defaults parse, partial user overrides preserving
+  defaults, unknown-key rejection, and validation boundaries.
+
 ## [0.2.3] - 2026-05-03
 
 ### Changed

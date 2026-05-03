@@ -1,56 +1,61 @@
 use crate::state::{Focus, KeybindingMode};
+use hjkl_config::{AppConfig, Validate, ValidationError, ensure_non_empty_str, ensure_non_zero};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+/// Bundled default config — the single source of truth for default values.
+/// User overrides are deep-merged on top via [`hjkl_config::load_layered_from`].
+pub const DEFAULTS_TOML: &str = include_str!("config.toml");
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MainConfig {
-    #[serde(default)]
     pub editor: EditorConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditorConfig {
     pub keybindings: KeybindingMode,
     pub lsp_binary: String,
-    #[serde(default = "default_mouse_scroll_lines")]
     pub mouse_scroll_lines: usize,
-    #[serde(default = "default_leader_key")]
     pub leader_key: String,
     /// Whether `Ctrl+Shift+Enter` (run-all) stops on the first query error.
-    #[serde(default = "default_stop_on_error")]
     pub stop_on_error: bool,
     /// Seconds before cached schema data (databases / tables / columns) is
     /// considered stale and re-fetched in the background. `0` disables TTL.
-    #[serde(default = "default_schema_ttl_secs")]
     pub schema_ttl_secs: u64,
 }
 
-fn default_mouse_scroll_lines() -> usize {
-    3
-}
-
-fn default_leader_key() -> String {
-    " ".to_string()
-}
-
-fn default_stop_on_error() -> bool {
-    true
-}
-
-fn default_schema_ttl_secs() -> u64 {
-    300
-}
-
-impl Default for EditorConfig {
+impl Default for MainConfig {
+    /// Parses the bundled [`DEFAULTS_TOML`]. Panics if the bundled file is
+    /// malformed — that's a build-time bug caught by [`tests::defaults_parse`].
     fn default() -> Self {
-        Self {
-            keybindings: KeybindingMode::Vim,
-            lsp_binary: "sqls".into(),
-            mouse_scroll_lines: default_mouse_scroll_lines(),
-            leader_key: default_leader_key(),
-            stop_on_error: default_stop_on_error(),
-            schema_ttl_secs: default_schema_ttl_secs(),
+        toml::from_str(DEFAULTS_TOML)
+            .expect("bundled sqeel-core/src/config.toml is invalid; build-time bug")
+    }
+}
+
+impl AppConfig for MainConfig {
+    const APPLICATION: &'static str = "sqeel";
+}
+
+impl Validate for MainConfig {
+    type Error = ValidationError;
+
+    fn validate(&self) -> Result<(), Self::Error> {
+        ensure_non_empty_str(&self.editor.lsp_binary, "editor.lsp_binary")?;
+        ensure_non_zero(self.editor.mouse_scroll_lines, "editor.mouse_scroll_lines")?;
+        // leader_key is a String for back-compat, but must be exactly one char.
+        // Multi-char (or empty) leaders can't be matched against a key event.
+        let leader_chars = self.editor.leader_key.chars().count();
+        if leader_chars != 1 {
+            return Err(ValidationError::new(
+                "editor.leader_key",
+                format!("must be a single character, got {leader_chars} chars"),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -154,39 +159,32 @@ pub fn config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("sqeel"))
 }
 
-const DEFAULT_CONFIG: &str = r#"[editor]
-keybindings = "vim"
-
-# Path to the SQL LSP binary (sqls recommended: https://github.com/sqls-server/sqls)
-lsp_binary = "sqls"
-
-# Number of lines to scroll per mouse wheel tick (applies to all panes)
-mouse_scroll_lines = 3
-
-# Leader key for chord shortcuts (e.g. <leader>c opens the connection switcher).
-# Use a single character; " " for Space.
-leader_key = " "
-
-# Stop running a Ctrl+Shift+Enter batch on the first query error.
-stop_on_error = true
-
-# Seconds before cached schema (databases / tables / columns) is considered
-# stale and silently re-fetched. 0 disables TTL.
-schema_ttl_secs = 300
-"#;
-
+/// Load + validate `MainConfig`.
+///
+/// Defaults are bundled into the binary via [`DEFAULTS_TOML`]; the user
+/// file at `<config_dir>/config.toml` is **deep-merged** on top
+/// (only overridden fields need to appear there). Unknown keys are
+/// rejected. Validation is run on the merged result and surfaces
+/// out-of-range values (empty `lsp_binary`, zero `mouse_scroll_lines`,
+/// non-single-char `leader_key`).
+///
+/// Missing user file → bundled defaults only. **Never writes to disk** —
+/// callers that want to scaffold a starter config can use
+/// [`hjkl_config::write_default`] explicitly.
 pub fn load_main_config() -> anyhow::Result<MainConfig> {
-    let dir = config_dir().ok_or_else(|| anyhow::anyhow!("cannot determine config dir"))?;
-    let path = dir.join("config.toml");
-
-    if !path.exists() {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, DEFAULT_CONFIG)?;
-        return Ok(MainConfig::default());
-    }
-
-    let content = std::fs::read_to_string(&path)?;
-    Ok(toml::from_str(&content)?)
+    let cfg = match config_dir() {
+        Some(dir) => {
+            let path = dir.join("config.toml");
+            if path.exists() {
+                hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, &path)?
+            } else {
+                MainConfig::default()
+            }
+        }
+        None => MainConfig::default(),
+    };
+    cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(cfg)
 }
 
 pub fn load_connections() -> anyhow::Result<Vec<ConnectionConfig>> {
@@ -323,6 +321,37 @@ pub fn save_connection(name: &str, url: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    /// Build-time check: the bundled defaults must parse into `MainConfig`.
+    /// If this fails, `MainConfig::default()` would panic at runtime.
+    #[test]
+    fn defaults_parse() {
+        let cfg: MainConfig =
+            toml::from_str(DEFAULTS_TOML).expect("bundled config.toml must parse");
+        assert_eq!(cfg.editor.keybindings, KeybindingMode::Vim);
+        assert_eq!(cfg.editor.lsp_binary, "sqls");
+        assert_eq!(cfg.editor.mouse_scroll_lines, 3);
+        assert_eq!(cfg.editor.leader_key, " ");
+        assert!(cfg.editor.stop_on_error);
+        assert_eq!(cfg.editor.schema_ttl_secs, 300);
+    }
+
+    #[test]
+    fn defaults_match_default_impl() {
+        let parsed: MainConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let dflt = MainConfig::default();
+        assert_eq!(parsed.editor.keybindings, dflt.editor.keybindings);
+        assert_eq!(parsed.editor.lsp_binary, dflt.editor.lsp_binary);
+        assert_eq!(parsed.editor.leader_key, dflt.editor.leader_key);
+    }
+
+    #[test]
+    fn defaults_pass_validation() {
+        MainConfig::default()
+            .validate()
+            .expect("bundled defaults must validate");
+    }
 
     #[test]
     fn default_config_has_vim_bindings() {
@@ -336,17 +365,75 @@ mod tests {
         assert_eq!(config.editor.lsp_binary, "sqls");
     }
 
+    /// Partial user TOML over bundled defaults: only overridden fields appear
+    /// in the user file; unspecified fields keep their bundled value.
     #[test]
-    fn keybinding_mode_deserialize_vim() {
-        let config: MainConfig = toml::from_str(
-            r#"
-[editor]
-keybindings = "vim"
-lsp_binary = "sqls"
-"#,
+    fn user_partial_override_keeps_defaults() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "[editor]\nlsp_binary = \"/opt/sqls\"\nmouse_scroll_lines = 5"
         )
         .unwrap();
-        assert_eq!(config.editor.keybindings, KeybindingMode::Vim);
+        let cfg: MainConfig = hjkl_config::load_layered_from(DEFAULTS_TOML, f.path()).unwrap();
+        // User overrides took effect:
+        assert_eq!(cfg.editor.lsp_binary, "/opt/sqls");
+        assert_eq!(cfg.editor.mouse_scroll_lines, 5);
+        // Non-overridden fields retain bundled values:
+        assert_eq!(cfg.editor.keybindings, KeybindingMode::Vim);
+        assert_eq!(cfg.editor.leader_key, " ");
+        assert!(cfg.editor.stop_on_error);
+        assert_eq!(cfg.editor.schema_ttl_secs, 300);
+    }
+
+    #[test]
+    fn user_unknown_key_is_rejected() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[editor]\nbogus = 1").unwrap();
+        let err =
+            hjkl_config::load_layered_from::<MainConfig>(DEFAULTS_TOML, f.path()).unwrap_err();
+        assert!(matches!(err, hjkl_config::ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_zero_mouse_scroll_lines() {
+        let mut cfg = MainConfig::default();
+        cfg.editor.mouse_scroll_lines = 0;
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "editor.mouse_scroll_lines");
+    }
+
+    #[test]
+    fn validate_rejects_empty_lsp_binary() {
+        let mut cfg = MainConfig::default();
+        cfg.editor.lsp_binary = String::new();
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "editor.lsp_binary");
+    }
+
+    #[test]
+    fn validate_rejects_multi_char_leader_key() {
+        let mut cfg = MainConfig::default();
+        cfg.editor.leader_key = "ab".into();
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "editor.leader_key");
+        assert!(err.message.contains("2 chars"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_leader_key() {
+        let mut cfg = MainConfig::default();
+        cfg.editor.leader_key = String::new();
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.field, "editor.leader_key");
+        assert!(err.message.contains("0 chars"));
+    }
+
+    #[test]
+    fn validate_accepts_unicode_single_char_leader_key() {
+        let mut cfg = MainConfig::default();
+        cfg.editor.leader_key = "α".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
