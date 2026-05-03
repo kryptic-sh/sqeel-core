@@ -8,7 +8,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Config loading migrated to `hjkl-config` 0.1.** Defaults now live in
+- **Config loading migrated to `hjkl-config` 0.2.** Defaults now live in
   `crates/sqeel-core/src/config.toml`, bundled via `include_str!()` and parsed
   at runtime as the single source of truth. The user file at
   `<config_dir>/config.toml` is **deep-merged** on top via
@@ -31,20 +31,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
   files keep working: `leader_key = " "` still parses (a single space is a valid
   `char`). Multi-char strings like `"ab"` now fail at parse time rather than
   being silently truncated or surfaced via a runtime validation message.
-- **Path migration on macOS/Windows:** `config_dir()` now routes through
-  `hjkl_config::config_dir::<MainConfig>()` instead of a hand-rolled
-  `dirs::config_dir().join("sqeel")`. Linux paths are unchanged
-  (`~/.config/sqeel/`). macOS moves from `~/Library/Application Support/sqeel/`
-  to `~/Library/Application Support/sh.kryptic.sqeel/`; Windows moves from
-  `%APPDATA%\sqeel\` to `%APPDATA%\kryptic\sqeel\config\`. Existing
-  macOS/Windows users will need to move their `config.toml`, `conns/`, and
-  `session.toml` to the new location. The application name now lives in exactly
-  one place: `AppConfig::APPLICATION = "sqeel"` on `MainConfig`. Sandbox
-  override (`set_config_dir_override`) for `--sandbox` is preserved.
+- **XDG-everywhere path migration on macOS/Windows.** Both `config_dir()` and
+  `data_dir()` (the latter in `persistence.rs`) now route through hjkl-config
+  0.2's XDG-everywhere resolver. Linux paths are unchanged (`~/.config/sqeel/`,
+  `~/.local/share/sqeel/`). macOS moves from
+  `~/Library/Application Support/sqeel/` to `~/.config/sqeel/` (config) and
+  `~/.local/share/sqeel/` (data). Windows moves from `%APPDATA%\sqeel\` to
+  `~/.config/sqeel/` and `~/.local/share/sqeel/`. Existing macOS/Windows users
+  will need to move their `config.toml`, `conns/`, `session.toml`, and
+  `queries/`/`results/` data to the new locations. `$XDG_CONFIG_HOME` and
+  `$XDG_DATA_HOME` are now honored on every platform — no more per-platform
+  conditionals in dotfile setups. Sandbox override (`set_config_dir_override` /
+  `set_data_dir_override`) for `--sandbox` is preserved.
 
 ### Added
 
-- `hjkl-config = "0.1"` dependency.
+- `hjkl-config = "0.2"` dependency.
 - `MainConfig` impls `hjkl_config::AppConfig` (`APPLICATION = "sqeel"`) and
   `hjkl_config::Validate` (with `ValidationError` as the associated error). The
   `Validate` hook composes the shared `ensure_non_empty_str` / `ensure_non_zero`

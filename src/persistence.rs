@@ -1,10 +1,13 @@
+use crate::config::MainConfig;
 use crate::state::QueryResult;
+use hjkl_config::AppConfig;
 use std::path::PathBuf;
 
 /// Process-wide override for the data dir, set by `--sandbox` so
-/// dev-mode runs don't touch the user's real
-/// `~/.local/share/sqeel/`. `None` (the default) falls back to
-/// `dirs::data_dir()`.
+/// dev-mode runs don't touch the user's real `~/.local/share/sqeel/`.
+/// `None` (the default) routes through [`hjkl_config::data_dir`] which
+/// is XDG-everywhere as of hjkl-config 0.2 (`$XDG_DATA_HOME/sqeel`,
+/// default `~/.local/share/sqeel` on every platform).
 static DATA_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Install a sandbox data dir. Idempotent — first call wins.
@@ -16,7 +19,7 @@ pub fn data_dir() -> Option<PathBuf> {
     if let Some(p) = DATA_DIR_OVERRIDE.get() {
         return Some(p.clone());
     }
-    dirs::data_dir().map(|d| d.join("sqeel"))
+    hjkl_config::data_dir(MainConfig::APPLICATION).ok()
 }
 
 /// Scratch queries are connection-agnostic — `queries/` lives directly

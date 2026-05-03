@@ -150,18 +150,16 @@ pub fn set_config_dir_override(path: PathBuf) {
 
 /// Resolve the sqeel config root. Sandbox override (set via
 /// [`set_config_dir_override`] from `--sandbox`) wins; otherwise routes
-/// through [`hjkl_config::config_dir`] using
-/// [`MainConfig`]'s [`AppConfig`] impl, so the application name lives in
-/// exactly one place (the trait constant). Per-platform paths:
+/// through [`hjkl_config::config_dir`] which is XDG-everywhere as of
+/// hjkl-config 0.2:
 ///
-/// - Linux: `$XDG_CONFIG_HOME/sqeel` (default `~/.config/sqeel`)
-/// - macOS: `~/Library/Application Support/sh.kryptic.sqeel`
-/// - Windows: `%APPDATA%\kryptic\sqeel\config`
+/// - Linux/macOS/Windows: `$XDG_CONFIG_HOME/sqeel`
+///   (default `~/.config/sqeel` on every platform)
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(p) = CONFIG_DIR_OVERRIDE.get() {
         return Some(p.clone());
     }
-    hjkl_config::config_dir::<MainConfig>().ok()
+    hjkl_config::config_dir(MainConfig::APPLICATION).ok()
 }
 
 /// Load + validate `MainConfig`.
