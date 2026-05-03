@@ -1,8 +1,33 @@
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tree_sitter::Parser;
 
-use hjkl_bonsai::{HighlightSpan as InnerSpan, LanguageRegistry, ParseError as InnerError};
+use hjkl_bonsai::runtime::{Grammar, GrammarLoader, GrammarRegistry};
+use hjkl_bonsai::{HighlightSpan as InnerSpan, ParseError as InnerError};
+
+/// Cache the dlopen-loaded SQL grammar so concurrent `Highlighter::new()`
+/// callers (parallel tests, multi-buffer editor sessions) share one
+/// `Arc<Grammar>`. Without this, parallel `dlopen` of the same shared
+/// library races inside `libloading`/`libdl` and trips SIGBUS or
+/// `git init` lock-file collisions during the first compile.
+static SQL_GRAMMAR: Mutex<Option<Arc<Grammar>>> = Mutex::new(None);
+
+fn sql_grammar() -> anyhow::Result<Arc<Grammar>> {
+    let mut guard = SQL_GRAMMAR
+        .lock()
+        .map_err(|_| anyhow::anyhow!("sql grammar mutex poisoned"))?;
+    if let Some(g) = guard.as_ref() {
+        return Ok(g.clone());
+    }
+    let registry = GrammarRegistry::embedded()?;
+    let loader = GrammarLoader::user_default()?;
+    let spec = registry
+        .by_name("sql")
+        .ok_or_else(|| anyhow::anyhow!("sql language not found in hjkl-bonsai registry"))?;
+    let grammar = Arc::new(Grammar::load("sql", spec, &loader)?);
+    *guard = Some(grammar.clone());
+    Ok(grammar)
+}
 
 /// SQL dialect the current connection is speaking. Drives per-dialect
 /// keyword promotion in the highlighter so things like `ILIKE` show as
@@ -236,11 +261,7 @@ pub struct Highlighter {
 
 impl Highlighter {
     pub fn new() -> anyhow::Result<Self> {
-        let registry = LanguageRegistry::new();
-        let config = registry
-            .by_name("sql")
-            .ok_or_else(|| anyhow::anyhow!("sql language not found in hjkl-bonsai registry"))?;
-        let inner = hjkl_bonsai::Highlighter::new(config)?;
+        let inner = hjkl_bonsai::Highlighter::new(sql_grammar()?)?;
         Ok(Self {
             inner,
             last_errors: Vec::new(),
