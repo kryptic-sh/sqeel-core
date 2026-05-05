@@ -13,7 +13,7 @@ rust-version = "1.95"
 readme = "README.md"
 
 [dependencies]
-sqeel-config = { path = "../sqeel-config", version = "0.4" }
+sqeel-config = "0.1"
 hjkl-engine = "0.3"
 hjkl-bonsai = "0.5"
 hjkl-config = "0.2"
