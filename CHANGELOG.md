@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `MainConfig`, `EditorConfig`, `load_main_config`, `config_dir`, and
+  `set_config_dir_override` extracted into the new `sqeel-config` crate.
+  Re-exported from `sqeel_core::config` so all existing call sites are
+  unaffected. `sqeel-config` is now a direct dependency.
+
 ## [0.3.1] - 2026-05-05
 
 ### Changed
