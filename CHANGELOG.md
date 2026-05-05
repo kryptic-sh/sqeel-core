@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`hjkl-bonsai` 0.3 → 0.5.** Migrated the two 0.4 breaking call sites in
+  `sql_grammar()`: `GrammarLoader::user_default` and `Grammar::load` now receive
+  `registry.meta()` (`&ManifestMeta`). No `LangSpec` is constructed manually and
+  sqeel ships no `bonsai.toml`, so those breaking changes had no further impact.
+  The 0.5 `highlight_range_with_injections` API is available for future
+  viewport-scoped adoption; `sqeel-core`'s `Highlighter` wrapper continues to
+  use `highlight_range` internally, which is correct for its caller-driven parse
+  model.
+
 ## [0.3.0] - 2026-05-03
 
 ### Changed

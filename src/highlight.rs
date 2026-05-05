@@ -20,11 +20,11 @@ fn sql_grammar() -> anyhow::Result<Arc<Grammar>> {
         return Ok(g.clone());
     }
     let registry = GrammarRegistry::embedded()?;
-    let loader = GrammarLoader::user_default()?;
+    let loader = GrammarLoader::user_default(registry.meta())?;
     let spec = registry
         .by_name("sql")
         .ok_or_else(|| anyhow::anyhow!("sql language not found in hjkl-bonsai registry"))?;
-    let grammar = Arc::new(Grammar::load("sql", spec, &loader)?);
+    let grammar = Arc::new(Grammar::load("sql", spec, &loader, registry.meta())?);
     *guard = Some(grammar.clone());
     Ok(grammar)
 }
