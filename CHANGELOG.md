@@ -6,8 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sql_grammar_blocking() -> anyhow::Result<Arc<Grammar>>`** — new public
+  function for sync callers (tests, CLI one-shots). Wraps the async loader with
+  `recv_blocking`; caches the result in the shared `SQL_GRAMMAR` static.
+- **`Highlighter::new_async() -> Highlighter`** — constructs a `Highlighter`
+  immediately without blocking. When the grammar is not yet ready, all highlight
+  calls return empty spans (plain-text fallback). The grammar attaches on the
+  first successful `try_upgrade()` tick.
+- **`Highlighter::try_upgrade(&mut self)`** — polls the non-blocking grammar
+  cache each tick and attaches the inner `hjkl_bonsai::Highlighter` once the
+  background load resolves. No-op once the highlighter is ready.
+- **`Highlighter::is_ready() -> bool`** — returns whether the inner highlighter
+  is attached.
+- Added `tracing` dependency for warn-level diagnostics on async load failures.
+
 ### Changed
 
+- **`sql_grammar()` signature changed from `anyhow::Result<Arc<Grammar>>` to
+  `Option<Arc<Grammar>>`** (breaking for direct callers). Returns `None` on
+  first call while the background grammar load is in-flight; returns `Some(arc)`
+  once the grammar is cached. Callers that need a `Result` should use
+  `sql_grammar_blocking()` instead.
+- **`Highlighter::inner` is now `Option<hjkl_bonsai::Highlighter>`**. All
+  highlight/parse methods short-circuit gracefully to empty vecs when `None`.
+  `Highlighter::new()` continues to block (calls `sql_grammar_blocking`) and is
+  still appropriate for tests. `Highlighter::default()` now uses `new_async()`
+  instead of `new()`.
+- Process-wide async grammar loader (`AsyncGrammarLoader`) stored in
+  `OnceLock<AsyncGrammarLoader>`; in-flight handle in
+  `Mutex<Option<LoadHandle>>`. Once the grammar resolves, the handle is cleared
+  and subsequent calls fast-return from the `SQL_GRAMMAR` cache.
 - `MainConfig`, `EditorConfig`, `load_main_config`, `config_dir`, and
   `set_config_dir_override` extracted into the new `sqeel-config` crate.
   Re-exported from `sqeel_core::config` so all existing call sites are

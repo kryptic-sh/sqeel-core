@@ -1,32 +1,162 @@
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tree_sitter::Parser;
 
-use hjkl_bonsai::runtime::{Grammar, GrammarLoader, GrammarRegistry};
+use hjkl_bonsai::runtime::{
+    AsyncGrammarLoader, Grammar, GrammarLoader, GrammarRegistry, LoadHandle,
+};
 use hjkl_bonsai::{HighlightSpan as InnerSpan, ParseError as InnerError};
 
-/// Cache the dlopen-loaded SQL grammar so concurrent `Highlighter::new()`
-/// callers (parallel tests, multi-buffer editor sessions) share one
-/// `Arc<Grammar>`. Without this, parallel `dlopen` of the same shared
-/// library races inside `libloading`/`libdl` and trips SIGBUS or
-/// `git init` lock-file collisions during the first compile.
-static SQL_GRAMMAR: Mutex<Option<Arc<Grammar>>> = Mutex::new(None);
+// ── process-wide async loader ─────────────────────────────────────────────────
 
-fn sql_grammar() -> anyhow::Result<Arc<Grammar>> {
-    let mut guard = SQL_GRAMMAR
-        .lock()
-        .map_err(|_| anyhow::anyhow!("sql grammar mutex poisoned"))?;
-    if let Some(g) = guard.as_ref() {
-        return Ok(g.clone());
+/// One `AsyncGrammarLoader` per process. Built lazily on first call to
+/// `sql_grammar()` or `sql_grammar_blocking()`. The 2 worker threads it spawns
+/// live for the rest of the process — that's fine.
+static ASYNC_LOADER: OnceLock<AsyncGrammarLoader> = OnceLock::new();
+
+fn async_loader() -> anyhow::Result<&'static AsyncGrammarLoader> {
+    if let Some(al) = ASYNC_LOADER.get() {
+        return Ok(al);
     }
     let registry = GrammarRegistry::embedded()?;
     let loader = GrammarLoader::user_default(registry.meta())?;
+    let al = AsyncGrammarLoader::new(loader);
+    // OnceLock::get_or_try_init is unstable; use set + get.
+    let _ = ASYNC_LOADER.set(al);
+    Ok(ASYNC_LOADER.get().expect("just set"))
+}
+
+// ── grammar cache + in-flight handle ─────────────────────────────────────────
+
+/// Fully resolved grammar. Populated once the async load finishes.
+static SQL_GRAMMAR: Mutex<Option<Arc<Grammar>>> = Mutex::new(None);
+
+/// In-flight `LoadHandle` from `load_async`. Taken out (→ `None`) the moment
+/// the handle resolves so subsequent ticks hit the cached `SQL_GRAMMAR` fast-path.
+static SQL_GRAMMAR_HANDLE: Mutex<Option<LoadHandle>> = Mutex::new(None);
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Build the `(spec, meta)` pair needed to enqueue a load. Cheap — only reads
+/// the embedded registry bytes; no I/O.
+fn sql_spec_and_meta() -> anyhow::Result<(
+    hjkl_bonsai::runtime::LangSpec,
+    hjkl_bonsai::runtime::ManifestMeta,
+)> {
+    let registry = GrammarRegistry::embedded()?;
     let spec = registry
         .by_name("sql")
-        .ok_or_else(|| anyhow::anyhow!("sql language not found in hjkl-bonsai registry"))?;
-    let grammar = Arc::new(Grammar::load("sql", spec, &loader, registry.meta())?);
-    *guard = Some(grammar.clone());
-    Ok(grammar)
+        .ok_or_else(|| anyhow::anyhow!("sql language not found in hjkl-bonsai registry"))?
+        .clone();
+    let meta = registry.meta().clone();
+    Ok((spec, meta))
+}
+
+/// Materialise a `Grammar` from the path returned by the async loader (the `.so`
+/// path, not its parent directory).
+fn grammar_from_path(so_path: std::path::PathBuf) -> anyhow::Result<Arc<Grammar>> {
+    Ok(Arc::new(Grammar::load_from_path("sql", &so_path)?))
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+/// Non-blocking grammar accessor used by the TUI render loop.
+///
+/// - First call: kicks off the background clone+compile and returns `None`.
+/// - Subsequent calls while pending: polls the handle; returns `None` when
+///   still in-flight, caches + returns `Some(arc)` once it resolves.
+/// - After caching: cheap fast-return of `Some(arc.clone())`.
+/// - On load error: logs via `tracing::warn!` and returns `None` so callers
+///   fall back to plain-text rendering gracefully. No retry this round.
+pub fn sql_grammar() -> Option<Arc<Grammar>> {
+    // Fast path: grammar already cached.
+    {
+        let guard = SQL_GRAMMAR.lock().ok()?;
+        if let Some(g) = guard.as_ref() {
+            return Some(g.clone());
+        }
+    }
+
+    // Poll or kick off the async load.
+    let mut handle_guard = SQL_GRAMMAR_HANDLE.lock().ok()?;
+
+    if let Some(handle) = handle_guard.as_ref() {
+        // Handle exists — poll for completion.
+        match handle.try_recv() {
+            None => return None, // still in-flight
+            Some(Ok(so_path)) => {
+                // Resolved — materialise Grammar, cache, return.
+                *handle_guard = None;
+                drop(handle_guard);
+                match grammar_from_path(so_path) {
+                    Ok(g) => {
+                        let mut grammar_guard = SQL_GRAMMAR.lock().ok()?;
+                        *grammar_guard = Some(g.clone());
+                        return Some(g);
+                    }
+                    Err(e) => {
+                        tracing::warn!("sql grammar materialise failed: {e:#}");
+                        return None;
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                tracing::warn!("sql grammar async load failed: {e}");
+                *handle_guard = None;
+                return None;
+            }
+        }
+    }
+
+    // No handle yet — kick off async load.
+    match (async_loader(), sql_spec_and_meta()) {
+        (Ok(al), Ok((spec, meta))) => {
+            *handle_guard = Some(al.load_async("sql".into(), spec, meta));
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("sql grammar async loader init failed: {e:#}");
+        }
+    }
+    None
+}
+
+/// Blocking variant for tests and CLI one-shots. Waits until the grammar is
+/// ready (may take 1–3 s on first run while the grammar is cloned + compiled).
+/// Production render loops should use [`sql_grammar`] (non-blocking) instead.
+pub fn sql_grammar_blocking() -> anyhow::Result<Arc<Grammar>> {
+    // Fast path: grammar already cached.
+    {
+        let guard = SQL_GRAMMAR
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sql grammar mutex poisoned"))?;
+        if let Some(g) = guard.as_ref() {
+            return Ok(g.clone());
+        }
+    }
+
+    let (spec, meta) = sql_spec_and_meta()?;
+    let al = async_loader()?;
+
+    // Check if an in-flight handle exists; if so take it, else kick a new one.
+    let handle = {
+        let mut handle_guard = SQL_GRAMMAR_HANDLE
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sql grammar handle mutex poisoned"))?;
+        handle_guard
+            .take()
+            .unwrap_or_else(|| al.load_async("sql".into(), spec, meta))
+    };
+
+    let so_path = handle
+        .recv_blocking()
+        .map_err(|e| anyhow::anyhow!("sql grammar load failed: {e}"))?;
+    let g = grammar_from_path(so_path)?;
+
+    let mut grammar_guard = SQL_GRAMMAR
+        .lock()
+        .map_err(|_| anyhow::anyhow!("sql grammar mutex poisoned"))?;
+    *grammar_guard = Some(g.clone());
+    Ok(g)
 }
 
 /// SQL dialect the current connection is speaking. Drives per-dialect
@@ -253,48 +383,102 @@ pub struct ParseError {
 /// - adds dialect-specific keyword promotion for SQL.
 /// - enriches spans with row/col from byte offsets.
 /// - caches last errors and block ranges.
+///
+/// The inner `hjkl_bonsai::Highlighter` is held as `Option` so the wrapper can
+/// be constructed before the grammar is ready. When `None`, all highlight calls
+/// return empty span lists (plain-text rendering) without panicking.
 pub struct Highlighter {
-    inner: hjkl_bonsai::Highlighter,
+    inner: Option<hjkl_bonsai::Highlighter>,
     last_errors: Vec<ParseError>,
     last_block_ranges: Vec<(usize, usize)>,
 }
 
 impl Highlighter {
+    /// Construct a `Highlighter`, loading the grammar synchronously.
+    ///
+    /// Suitable for tests and CLI one-shots where blocking is acceptable.
+    /// In the TUI render loop use `Highlighter::new_async` so the first
+    /// grammar load does not freeze the UI.
     pub fn new() -> anyhow::Result<Self> {
-        let inner = hjkl_bonsai::Highlighter::new(sql_grammar()?)?;
+        let grammar = sql_grammar_blocking()?;
+        let inner = hjkl_bonsai::Highlighter::new(grammar)?;
         Ok(Self {
-            inner,
+            inner: Some(inner),
             last_errors: Vec::new(),
             last_block_ranges: Vec::new(),
         })
     }
 
+    /// Construct a `Highlighter` using the non-blocking grammar accessor.
+    ///
+    /// Returns a `Highlighter` immediately regardless of whether the grammar
+    /// is ready yet. When the grammar is not ready, `inner` is `None` and
+    /// highlight calls return empty spans (plain-text fallback). The caller
+    /// should call `try_upgrade()` each tick to attach the grammar once it
+    /// resolves. Suitable for the TUI render loop.
+    pub fn new_async() -> Self {
+        let inner = sql_grammar().and_then(|g| hjkl_bonsai::Highlighter::new(g).ok());
+        Self {
+            inner,
+            last_errors: Vec::new(),
+            last_block_ranges: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if the inner `hjkl_bonsai::Highlighter` is present.
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Poll the non-blocking grammar cache and attach the inner highlighter
+    /// if it resolved since the last call. Cheap no-op once ready.
+    pub fn try_upgrade(&mut self) {
+        if self.inner.is_some() {
+            return;
+        }
+        if let Some(g) = sql_grammar()
+            && let Ok(h) = hjkl_bonsai::Highlighter::new(g)
+        {
+            self.inner = Some(h);
+        }
+    }
+
     /// Apply an `InputEdit` to the retained tree. Delegates to
     /// `hjkl_bonsai::Highlighter::edit`.
     pub fn edit(&mut self, edit: &tree_sitter::InputEdit) {
-        self.inner.edit(edit);
+        if let Some(inner) = self.inner.as_mut() {
+            inner.edit(edit);
+        }
     }
 
     /// Cold parse `source` from scratch into the retained tree.
     pub fn parse_initial(&mut self, source: &str) {
-        self.inner.parse_initial(source.as_bytes());
+        if let Some(inner) = self.inner.as_mut() {
+            inner.parse_initial(source.as_bytes());
+        }
     }
 
     /// Reparse `source` against the retained tree under the configured
     /// timeout. Returns `false` on timeout (callers must skip the
-    /// highlight pass for this frame).
+    /// highlight pass for this frame). Returns `true` when grammar is not
+    /// yet available (no tree to invalidate — callers may proceed normally).
     pub fn parse_incremental(&mut self, source: &str) -> bool {
-        self.inner.parse_incremental(source.as_bytes())
+        self.inner
+            .as_mut()
+            .map(|inner| inner.parse_incremental(source.as_bytes()))
+            .unwrap_or(true)
     }
 
     /// Drop the retained tree.
     pub fn reset(&mut self) {
-        self.inner.reset();
+        if let Some(inner) = self.inner.as_mut() {
+            inner.reset();
+        }
     }
 
     /// Read accessor for the retained tree.
     pub fn tree(&self) -> Option<&tree_sitter::Tree> {
-        self.inner.tree()
+        self.inner.as_ref().and_then(|inner| inner.tree())
     }
 
     /// Run the highlights query against the retained tree, scoped to
@@ -302,14 +486,24 @@ impl Highlighter {
     /// keyword promotion across the same byte_range, and refreshes the
     /// cached `last_errors` (range-scoped) + `last_block_ranges` (full
     /// retained tree).
+    ///
+    /// Returns an empty `Vec` when the grammar is not yet ready.
     pub fn highlight_range(
         &mut self,
         source: &str,
         dialect: Dialect,
         byte_range: Range<usize>,
     ) -> Vec<HighlightSpan> {
+        let inner = match self.inner.as_mut() {
+            Some(i) => i,
+            None => {
+                self.last_errors.clear();
+                self.last_block_ranges.clear();
+                return vec![];
+            }
+        };
         let bytes = source.as_bytes();
-        let inner_spans = self.inner.highlight_range(bytes, byte_range.clone());
+        let inner_spans = inner.highlight_range(bytes, byte_range.clone());
 
         let mut spans: Vec<HighlightSpan> = inner_spans
             .into_iter()
@@ -335,7 +529,7 @@ impl Highlighter {
             &mut spans,
         );
 
-        let inner_errors = self.inner.parse_errors_range(bytes, byte_range);
+        let inner_errors = inner.parse_errors_range(bytes, byte_range);
         self.last_errors = inner_errors
             .into_iter()
             .filter_map(|e| {
@@ -360,7 +554,7 @@ impl Highlighter {
             })
             .collect();
 
-        if let Some(tree) = self.inner.tree() {
+        if let Some(tree) = self.inner.as_ref().and_then(|i| i.tree()) {
             let mut block_ranges = Vec::new();
             collect_block_ranges(tree.root_node(), &mut block_ranges);
             block_ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
@@ -376,9 +570,15 @@ impl Highlighter {
     /// Harvest parse errors across the full source via the retained tree.
     /// Used by status-line "first error" jumps where range-scoped errors
     /// aren't sufficient.
+    ///
+    /// Returns an empty `Vec` when the grammar is not yet ready.
     pub fn parse_errors_full(&mut self, source: &str, dialect: Dialect) -> Vec<ParseError> {
+        let inner = match self.inner.as_mut() {
+            Some(i) => i,
+            None => return vec![],
+        };
         let bytes = source.as_bytes();
-        let inner_errors = self.inner.parse_errors_range(bytes, 0..bytes.len());
+        let inner_errors = inner.parse_errors_range(bytes, 0..bytes.len());
         inner_errors
             .into_iter()
             .filter_map(|e| {
@@ -427,6 +627,8 @@ impl Highlighter {
     }
 
     /// Highlight a shared source buffer (avoids clone for large buffers).
+    ///
+    /// Returns an empty `Vec` when the grammar is not yet ready.
     pub fn highlight_shared(
         &mut self,
         source: &Arc<String>,
@@ -438,6 +640,15 @@ impl Highlighter {
             return vec![];
         }
 
+        let inner = match self.inner.as_mut() {
+            Some(i) => i,
+            None => {
+                self.last_errors.clear();
+                self.last_block_ranges.clear();
+                return vec![];
+            }
+        };
+
         let bytes = source.as_bytes();
 
         // Legacy full-buffer API: no caller-supplied InputEdits, so the
@@ -445,10 +656,10 @@ impl Highlighter {
         // Reset before parsing so we always do a cold full parse and the
         // span set is consistent with what a fresh `Highlighter` would
         // produce.
-        self.inner.reset();
+        inner.reset();
 
         // Get inner spans (capture-name tagged, byte-range only).
-        let inner_spans: Vec<InnerSpan> = self.inner.highlight(bytes);
+        let inner_spans: Vec<InnerSpan> = inner.highlight(bytes);
 
         // Enrich with row/col and dialect keyword promotion.
         let mut spans: Vec<HighlightSpan> = inner_spans
@@ -472,7 +683,7 @@ impl Highlighter {
         promote_uncovered_dialect_keywords(source.as_str(), dialect, &mut spans);
 
         // Harvest parse errors.
-        let inner_errors: Vec<InnerError> = self.inner.parse_errors(bytes);
+        let inner_errors: Vec<InnerError> = inner.parse_errors(bytes);
         self.last_errors = inner_errors
             .into_iter()
             .filter_map(|e| {
@@ -499,12 +710,17 @@ impl Highlighter {
             .collect();
 
         // Collect block ranges from a fresh parse of the same source.
-        if let Some(syntax) = self.inner.parse(bytes) {
-            let mut block_ranges = Vec::new();
-            collect_block_ranges(syntax.tree().root_node(), &mut block_ranges);
-            block_ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-            block_ranges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-            self.last_block_ranges = block_ranges;
+        // Re-borrow inner (can't hold from above because self.last_errors was borrowed).
+        if let Some(inner2) = self.inner.as_mut() {
+            if let Some(syntax) = inner2.parse(bytes) {
+                let mut block_ranges = Vec::new();
+                collect_block_ranges(syntax.tree().root_node(), &mut block_ranges);
+                block_ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                block_ranges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+                self.last_block_ranges = block_ranges;
+            } else {
+                self.last_block_ranges.clear();
+            }
         } else {
             self.last_block_ranges.clear();
         }
@@ -515,7 +731,7 @@ impl Highlighter {
 
 impl Default for Highlighter {
     fn default() -> Self {
-        Self::new().expect("failed to initialize hjkl-bonsai SQL highlighter")
+        Self::new_async()
     }
 }
 
@@ -1517,5 +1733,42 @@ mod tests {
         assert!(Dialect::Sqlite.is_extra_keyword("PRAGMA"));
         assert!(Dialect::Postgres.is_extra_keyword("LISTEN"));
         assert!(!Dialect::Postgres.is_extra_keyword("DESC"));
+    }
+
+    /// `sql_grammar_blocking()` must return a usable `Arc<Grammar>`.
+    #[test]
+    fn sql_grammar_blocking_returns_grammar() {
+        let g = sql_grammar_blocking().expect("sql_grammar_blocking failed");
+        assert_eq!(g.name(), "sql");
+    }
+
+    /// A `Highlighter` built with `new_async` before the grammar resolves must
+    /// return empty spans rather than panicking. After `try_upgrade` (and once
+    /// the blocking grammar is cached) it should be ready and highlight normally.
+    #[test]
+    fn new_async_returns_empty_spans_when_not_ready_then_upgrades() {
+        // Build a highlighter that may or may not have the grammar yet.
+        let mut h = Highlighter::new_async();
+        // Whether ready or not, highlighting must not panic and must return a
+        // Vec (empty when grammar is absent, non-empty when present).
+        let spans_before = h.highlight("SELECT 1", Dialect::Generic);
+        if !h.is_ready() {
+            assert!(
+                spans_before.is_empty(),
+                "expected empty spans when grammar not ready"
+            );
+        }
+        // Force grammar resolution and upgrade.
+        sql_grammar_blocking().expect("blocking load failed");
+        h.try_upgrade();
+        assert!(
+            h.is_ready(),
+            "Highlighter should be ready after try_upgrade"
+        );
+        let spans_after = h.highlight("SELECT 1", Dialect::Generic);
+        assert!(
+            !spans_after.is_empty(),
+            "expected keyword spans after grammar loaded; got: {spans_after:#?}"
+        );
     }
 }
