@@ -1,21 +1,15 @@
 use crate::state::Focus;
 use serde::{Deserialize, Serialize};
 
-// MainConfig, EditorConfig, and the loader entry points now live in sqeel-config.
-// Re-export them here so existing call sites (`sqeel_core::config::MainConfig`, etc.)
+// MainConfig, EditorConfig, connection helpers, and the loader entry points now
+// live in sqeel-config. Re-export them here so existing call sites
+// (`sqeel_core::config::MainConfig`, `sqeel_core::config::ConnectionConfig`, etc.)
 // continue to work without any changes.
 pub use sqeel_config::{
-    DEFAULTS_TOML, EditorConfig, KeybindingMode, MainConfig, config_dir, load_main_config,
+    ConnectionConfig, DEFAULTS_TOML, EditorConfig, KeybindingMode, MainConfig, config_dir,
+    delete_connection, load_connections, load_main_config, save_connection,
     set_config_dir_override,
 };
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ConnectionConfig {
-    pub url: String,
-    // Derived from filename at load time; not present in the .toml file itself.
-    #[serde(default, skip_serializing)]
-    pub name: String,
-}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct TabCursor {
@@ -90,34 +84,6 @@ pub struct SessionData {
     pub active_result_tab: usize,
 }
 
-pub fn load_connections() -> anyhow::Result<Vec<ConnectionConfig>> {
-    let conns_dir = config_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine config dir"))?
-        .join("conns");
-
-    if !conns_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut conns = Vec::new();
-    for entry in std::fs::read_dir(&conns_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let content = std::fs::read_to_string(&path)?;
-            let mut conn: ConnectionConfig = toml::from_str(&content)?;
-            conn.name = name;
-            conns.push(conn);
-        }
-    }
-    Ok(conns)
-}
-
 /// Save session state to session.toml.
 #[allow(clippy::too_many_arguments)]
 pub fn save_session(
@@ -188,52 +154,4 @@ pub fn load_session() -> Option<String> {
             Some(s.connection)
         }
     })
-}
-
-pub fn delete_connection(name: &str) -> anyhow::Result<()> {
-    let path = config_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine config dir"))?
-        .join("conns")
-        .join(format!("{name}.toml"));
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-pub fn save_connection(name: &str, url: &str) -> anyhow::Result<()> {
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        anyhow::bail!("Connection name may only contain letters, digits, - and _");
-    }
-    let conns_dir = config_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine config dir"))?
-        .join("conns");
-    std::fs::create_dir_all(&conns_dir)?;
-    let conn = ConnectionConfig {
-        url: url.to_string(),
-        name: String::new(),
-    };
-    let content = toml::to_string(&conn)?;
-    std::fs::write(conns_dir.join(format!("{name}.toml")), content)?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn connection_config_parse() {
-        let conn: ConnectionConfig = toml::from_str(
-            r#"
-url = "mysql://user:pass@localhost/mydb"
-name = "local"
-"#,
-        )
-        .unwrap();
-        assert_eq!(conn.url, "mysql://user:pass@localhost/mydb");
-    }
 }

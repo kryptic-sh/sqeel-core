@@ -12,6 +12,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `set_config_dir_override` extracted into the new `sqeel-config` crate.
   Re-exported from `sqeel_core::config` so all existing call sites are
   unaffected. `sqeel-config` is now a direct dependency.
+- `ConnectionConfig`, `load_connections`, `save_connection`, and
+  `delete_connection` moved to `sqeel-config`. Re-exported from
+  `sqeel_core::config` — all call sites in `sqeel-core::state`, `sqeel-tui`, and
+  `apps/sqeel` are unaffected.
 
 ## [0.3.1] - 2026-05-05
 
