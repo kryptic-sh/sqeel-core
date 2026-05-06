@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-07
+
+### Changed
+
+- CI: collapsed `ci.yml` + `release.yml` + `_tests.yml` into a single `ci.yml`;
+  added dependabot config for Cargo and GitHub Actions (weekly).
+
 ## [0.4.0] - 2026-05-05
 
 ### Added
@@ -161,7 +168,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.3.1
 [0.3.0]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.3.0
