@@ -503,7 +503,8 @@ impl Highlighter {
             }
         };
         let bytes = source.as_bytes();
-        let inner_spans = inner.highlight_range(bytes, byte_range.clone());
+        let mut inner_spans = inner.highlight_range(bytes, byte_range.clone());
+        hjkl_bonsai::CommentMarkerPass::new().apply(&mut inner_spans, bytes);
 
         let mut spans: Vec<HighlightSpan> = inner_spans
             .into_iter()
@@ -659,7 +660,8 @@ impl Highlighter {
         inner.reset();
 
         // Get inner spans (capture-name tagged, byte-range only).
-        let inner_spans: Vec<InnerSpan> = inner.highlight(bytes);
+        let mut inner_spans: Vec<InnerSpan> = inner.highlight(bytes);
+        hjkl_bonsai::CommentMarkerPass::new().apply(&mut inner_spans, bytes);
 
         // Enrich with row/col and dialect keyword promotion.
         let mut spans: Vec<HighlightSpan> = inner_spans
