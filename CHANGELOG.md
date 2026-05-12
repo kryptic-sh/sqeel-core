@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-05-13
+
+### Changed
+
+- Bumped `hjkl-engine` from 0.3 to 0.5 and `hjkl-bonsai` from 0.5 to 0.6.
+  Re-exported `{KeybindingMode, VimMode}` now resolve to engine 0.5, collapsing
+  the dependency graph for downstream consumers that previously straddled engine
+  majors. No source-level API change — engine 0.5's variants and bonsai 0.6's
+  runtime module are API-compatible with the previous versions.
+- `sqeel-config` dependency bumped to `0.2.3` (engine-0.5).
+
 ## [0.4.2] - 2026-05-13
 
 ### Changed
@@ -191,7 +202,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.3
 [0.4.2]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.2
 [0.4.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.0
