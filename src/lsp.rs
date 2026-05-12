@@ -2,7 +2,10 @@
 //! Public surface (LspClient, LspWriter, LspEvent, Diagnostic, write_sqls_config) unchanged.
 
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
 
 use anyhow::Context;
 use hjkl_lsp::{BufferId, LspConfig, LspEvent as HjklLspEvent, LspManager, ServerConfig};
@@ -12,7 +15,9 @@ use tokio::sync::mpsc;
 
 const BUF: BufferId = 1;
 static ID: AtomicI64 = AtomicI64::new(1);
-fn next_id() -> i64 { ID.fetch_add(1, Ordering::SeqCst) }
+fn next_id() -> i64 {
+    ID.fetch_add(1, Ordering::SeqCst)
+}
 
 // ── sqeel-specific config writer ─────────────────────────────────────────────
 
@@ -29,15 +34,23 @@ pub fn write_sqls_config(url: &str) -> anyhow::Result<PathBuf> {
 
 fn sqls_driver_and_dsn(url: &str) -> anyhow::Result<(&'static str, String)> {
     use anyhow::Context as _;
-    if let Some(rest) = url.strip_prefix("mysql://").or_else(|| url.strip_prefix("mariadb://")) {
-        let (userpass, after) = rest.split_once('@').context("mysql url missing `user@host`")?;
+    if let Some(rest) = url
+        .strip_prefix("mysql://")
+        .or_else(|| url.strip_prefix("mariadb://"))
+    {
+        let (userpass, after) = rest
+            .split_once('@')
+            .context("mysql url missing `user@host`")?;
         let (hostport, db_and_rest) = after.split_once('/').unwrap_or((after, ""));
         let db = db_and_rest.split('?').next().unwrap_or("");
         Ok(("mysql", format!("{userpass}@tcp({hostport})/{db}")))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         Ok(("postgresql", url.to_string()))
     } else if url.starts_with("sqlite:") {
-        let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or("");
+        let path = url
+            .strip_prefix("sqlite://")
+            .or_else(|| url.strip_prefix("sqlite:"))
+            .unwrap_or("");
         Ok(("sqlite3", path.to_string()))
     } else {
         anyhow::bail!("unsupported URL scheme for sqls config: {url}")
@@ -66,7 +79,9 @@ pub enum LspEvent {
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
-struct Inner { manager: LspManager }
+struct Inner {
+    manager: LspManager,
+}
 
 pub struct LspClient {
     inner: Arc<Inner>,
@@ -74,7 +89,11 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    pub async fn start(binary: &str, _root_uri: Option<Uri>, args: &[String]) -> anyhow::Result<Self> {
+    pub async fn start(
+        binary: &str,
+        _root_uri: Option<Uri>,
+        args: &[String],
+    ) -> anyhow::Result<Self> {
         // Probe binary availability early (matches old behaviour).
         std::process::Command::new(binary)
             .args(args)
@@ -82,17 +101,25 @@ impl LspClient {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map(|mut c| { let _ = c.kill(); })
+            .map(|mut c| {
+                let _ = c.kill();
+            })
             .with_context(|| format!("failed to spawn LSP: {binary}"))?;
 
         let mut servers = std::collections::HashMap::new();
-        servers.insert("sql".to_string(), ServerConfig {
-            command: binary.to_string(),
-            args: args.to_vec(),
-            root_markers: vec![],
-            shutdown_idle_after_secs: 0,
-        });
-        let config = LspConfig { enabled: true, servers };
+        servers.insert(
+            "sql".to_string(),
+            ServerConfig {
+                command: binary.to_string(),
+                args: args.to_vec(),
+                root_markers: vec![],
+                shutdown_idle_after_secs: 0,
+            },
+        );
+        let config = LspConfig {
+            enabled: true,
+            servers,
+        };
         let manager = LspManager::spawn(config);
         let inner = Arc::new(Inner { manager });
         let (evt_tx, evt_rx) = mpsc::channel::<LspEvent>(64);
@@ -101,15 +128,25 @@ impl LspClient {
             .name("sqeel-lsp-bridge".to_string())
             .spawn(move || bridge_loop(&mgr_ref.manager, evt_tx))
             .context("failed to spawn lsp bridge thread")?;
-        Ok(Self { inner, events: evt_rx })
+        Ok(Self {
+            inner,
+            events: evt_rx,
+        })
     }
 
     pub async fn open_document(&mut self, uri: Uri, text: &str) -> anyhow::Result<()> {
-        self.inner.manager.attach_buffer(BUF, &uri_to_path(&uri), "sql", text);
+        self.inner
+            .manager
+            .attach_buffer(BUF, &uri_to_path(&uri), "sql", text);
         Ok(())
     }
 
-    pub async fn change_document(&mut self, _uri: Uri, _version: i32, text: &str) -> anyhow::Result<()> {
+    pub async fn change_document(
+        &mut self,
+        _uri: Uri,
+        _version: i32,
+        text: &str,
+    ) -> anyhow::Result<()> {
         self.inner.manager.notify_change(BUF, text);
         Ok(())
     }
@@ -120,15 +157,24 @@ impl LspClient {
     }
 
     pub fn writer(&self) -> LspWriter {
-        LspWriter { inner: Arc::clone(&self.inner) }
+        LspWriter {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct LspWriter { inner: Arc<Inner> }
+pub struct LspWriter {
+    inner: Arc<Inner>,
+}
 
 impl LspWriter {
-    pub async fn change_document(&self, _uri: Uri, _version: i32, text: &str) -> anyhow::Result<()> {
+    pub async fn change_document(
+        &self,
+        _uri: Uri,
+        _version: i32,
+        text: &str,
+    ) -> anyhow::Result<()> {
         self.inner.manager.notify_change(BUF, text);
         Ok(())
     }
@@ -164,8 +210,10 @@ fn bridge_loop(manager: &LspManager, tx: mpsc::Sender<LspEvent>) {
     loop {
         match manager.try_recv_event() {
             Some(evt) => {
-                if let Some(e) = translate_event(evt) {
-                    if tx.blocking_send(e).is_err() { break; }
+                if let Some(e) = translate_event(evt)
+                    && tx.blocking_send(e).is_err()
+                {
+                    break;
                 }
             }
             None => std::thread::sleep(std::time::Duration::from_millis(1)),
@@ -175,15 +223,28 @@ fn bridge_loop(manager: &LspManager, tx: mpsc::Sender<LspEvent>) {
 
 fn translate_event(evt: HjklLspEvent) -> Option<LspEvent> {
     match evt {
-        HjklLspEvent::Notification { method, params, .. } if method == "textDocument/publishDiagnostics" => {
+        HjklLspEvent::Notification { method, params, .. }
+            if method == "textDocument/publishDiagnostics" =>
+        {
             let p: lsp_types::PublishDiagnosticsParams = serde_json::from_value(params).ok()?;
-            Some(LspEvent::Diagnostics(p.diagnostics.into_iter().map(|d| Diagnostic {
-                line: d.range.start.line, col: d.range.start.character,
-                end_line: d.range.end.line, end_col: d.range.end.character,
-                message: d.message, severity: d.severity.unwrap_or(DiagnosticSeverity::ERROR),
-            }).collect()))
+            Some(LspEvent::Diagnostics(
+                p.diagnostics
+                    .into_iter()
+                    .map(|d| Diagnostic {
+                        line: d.range.start.line,
+                        col: d.range.start.character,
+                        end_line: d.range.end.line,
+                        end_col: d.range.end.character,
+                        message: d.message,
+                        severity: d.severity.unwrap_or(DiagnosticSeverity::ERROR),
+                    })
+                    .collect(),
+            ))
         }
-        HjklLspEvent::Response { request_id, result: Ok(value) } => translate_response(request_id, value),
+        HjklLspEvent::Response {
+            request_id,
+            result: Ok(value),
+        } => translate_response(request_id, value),
         _ => None,
     }
 }
@@ -194,16 +255,27 @@ fn translate_response(id: i64, result: Value) -> Option<LspEvent> {
         let loc = match def {
             GotoDefinitionResponse::Scalar(l) => Some((l.uri, l.range.start)),
             GotoDefinitionResponse::Array(mut v) => v.pop().map(|l| (l.uri, l.range.start)),
-            GotoDefinitionResponse::Link(mut v) => v.pop().map(|l| (l.target_uri, l.target_selection_range.start)),
+            GotoDefinitionResponse::Link(mut v) => v
+                .pop()
+                .map(|l| (l.target_uri, l.target_selection_range.start)),
         };
         if let Some((uri, pos)) = loc {
-            return Some(LspEvent::Definition(id, uri.to_string(), pos.line, pos.character));
+            return Some(LspEvent::Definition(
+                id,
+                uri.to_string(),
+                pos.line,
+                pos.character,
+            ));
         }
     }
     if let Ok(hover) = serde_json::from_value::<Hover>(result.clone()) {
         if let Some(path) = &debug {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 let _ = writeln!(f, "### lsp hover response id={id}");
             }
         }
@@ -218,7 +290,11 @@ fn translate_response(id: i64, result: Value) -> Option<LspEvent> {
     }
     if let Some(path) = &debug {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "### lsp unroutable response id={id}");
         }
     }
@@ -238,12 +314,18 @@ fn hover_text_from_contents(contents: &HoverContents) -> Option<String> {
         HoverContents::Markup(m) => m.value.clone(),
     };
     let t = text.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 fn uri_to_path(uri: &Uri) -> PathBuf {
-    if let Ok(url) = url::Url::parse(uri.as_str()) {
-        if let Ok(p) = url.to_file_path() { return p; }
+    if let Ok(url) = url::Url::parse(uri.as_str())
+        && let Ok(p) = url.to_file_path()
+    {
+        return p;
     }
     let s = uri.as_str();
     PathBuf::from(s.strip_prefix("file://").unwrap_or(s))
@@ -257,7 +339,8 @@ mod tests {
 
     #[test]
     fn sqls_driver_and_dsn_mysql() {
-        let (driver, dsn) = super::sqls_driver_and_dsn("mysql://root:secret@localhost:3306/mydb").unwrap();
+        let (driver, dsn) =
+            super::sqls_driver_and_dsn("mysql://root:secret@localhost:3306/mydb").unwrap();
         assert_eq!(driver, "mysql");
         assert_eq!(dsn, "root:secret@tcp(localhost:3306)/mydb");
     }
@@ -300,15 +383,22 @@ mod tests {
     #[test]
     fn hover_text_scalar_string_extracted() {
         let contents = HoverContents::Scalar(MarkedString::String("hello".into()));
-        assert_eq!(super::hover_text_from_contents(&contents), Some("hello".into()));
+        assert_eq!(
+            super::hover_text_from_contents(&contents),
+            Some("hello".into())
+        );
     }
 
     #[test]
     fn hover_text_scalar_language_string_extracted() {
         let contents = HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
-            language: "sql".into(), value: "SELECT 1".into(),
+            language: "sql".into(),
+            value: "SELECT 1".into(),
         }));
-        assert_eq!(super::hover_text_from_contents(&contents), Some("SELECT 1".into()));
+        assert_eq!(
+            super::hover_text_from_contents(&contents),
+            Some("SELECT 1".into())
+        );
     }
 
     #[test]
@@ -317,15 +407,22 @@ mod tests {
             MarkedString::String("line1".into()),
             MarkedString::String("line2".into()),
         ]);
-        assert_eq!(super::hover_text_from_contents(&contents), Some("line1\nline2".into()));
+        assert_eq!(
+            super::hover_text_from_contents(&contents),
+            Some("line1\nline2".into())
+        );
     }
 
     #[test]
     fn hover_text_markup_extracted() {
         let contents = HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown, value: "## schema.table".into(),
+            kind: MarkupKind::Markdown,
+            value: "## schema.table".into(),
         });
-        assert_eq!(super::hover_text_from_contents(&contents), Some("## schema.table".into()));
+        assert_eq!(
+            super::hover_text_from_contents(&contents),
+            Some("## schema.table".into())
+        );
     }
 
     #[test]
