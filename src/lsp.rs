@@ -1,61 +1,50 @@
+//! LSP adapter: thin wrapper over [`hjkl_lsp::LspManager`].
+//! Public surface (LspClient, LspWriter, LspEvent, Diagnostic, write_sqls_config) unchanged.
+
+use std::path::PathBuf;
+use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+
 use anyhow::Context;
+use hjkl_lsp::{BufferId, LspConfig, LspEvent as HjklLspEvent, LspManager, ServerConfig};
 use lsp_types::*;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
+const BUF: BufferId = 1;
 static ID: AtomicI64 = AtomicI64::new(1);
+fn next_id() -> i64 { ID.fetch_add(1, Ordering::SeqCst) }
 
-fn next_id() -> i64 {
-    ID.fetch_add(1, Ordering::SeqCst)
-}
+// ── sqeel-specific config writer ─────────────────────────────────────────────
 
-/// Generate a `sqls` config file from a sqlx-style connection URL and
-/// write it to a per-process temp path. Returns the path so the caller
-/// can pass `--config=<path>` (or similar) when spawning sqls. The
-/// config contains a single connection entry — sqls picks the first
-/// one by default so no further wiring is needed.
-pub fn write_sqls_config(url: &str) -> anyhow::Result<std::path::PathBuf> {
+/// Write a `sqls` config file for the given connection URL.
+pub fn write_sqls_config(url: &str) -> anyhow::Result<PathBuf> {
     let (driver, dsn) = sqls_driver_and_dsn(url)?;
     let yaml = format!(
         "lowercaseKeywords: false\nconnections:\n  - alias: sqeel\n    driver: {driver}\n    dataSourceName: \"{dsn}\"\n"
     );
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!("sqeel-sqls-config-{}.yml", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sqeel-sqls-config-{}.yml", std::process::id()));
     std::fs::write(&path, yaml)?;
     Ok(path)
 }
 
 fn sqls_driver_and_dsn(url: &str) -> anyhow::Result<(&'static str, String)> {
     use anyhow::Context as _;
-    if let Some(rest) = url
-        .strip_prefix("mysql://")
-        .or_else(|| url.strip_prefix("mariadb://"))
-    {
-        // sqls expects MySQL DSN form `user[:pass]@tcp(host[:port])/db`.
-        let (userpass, after) = rest
-            .split_once('@')
-            .context("mysql url missing `user@host`")?;
+    if let Some(rest) = url.strip_prefix("mysql://").or_else(|| url.strip_prefix("mariadb://")) {
+        let (userpass, after) = rest.split_once('@').context("mysql url missing `user@host`")?;
         let (hostport, db_and_rest) = after.split_once('/').unwrap_or((after, ""));
         let db = db_and_rest.split('?').next().unwrap_or("");
         Ok(("mysql", format!("{userpass}@tcp({hostport})/{db}")))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        // sqls `postgresql` driver accepts libpq URIs directly.
         Ok(("postgresql", url.to_string()))
     } else if url.starts_with("sqlite:") {
-        let path = url
-            .strip_prefix("sqlite://")
-            .or_else(|| url.strip_prefix("sqlite:"))
-            .unwrap_or("");
+        let path = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")).unwrap_or("");
         Ok(("sqlite3", path.to_string()))
     } else {
         anyhow::bail!("unsupported URL scheme for sqls config: {url}")
     }
 }
+
+// ── Domain types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
@@ -70,534 +59,197 @@ pub struct Diagnostic {
 #[derive(Debug)]
 pub enum LspEvent {
     Diagnostics(Vec<Diagnostic>),
-    /// (request_id, items) — caller drops if id doesn't match the latest request
     Completion(i64, Vec<String>),
-    /// (request_id, markdown/plain text) — hover payload for the `K`
-    /// binding. Caller drops if id doesn't match the latest request.
     Hover(i64, String),
-    /// (request_id, target uri, 0-based line, 0-based char column) —
-    /// resolved location for a `gd` goto-definition. Caller jumps
-    /// the editor cursor to the target (or surfaces the uri in a
-    /// toast if it's outside the active buffer).
     Definition(i64, String, u32, u32),
 }
 
-#[derive(Serialize)]
-struct RpcRequest {
-    jsonrpc: &'static str,
-    id: i64,
-    method: &'static str,
-    params: Value,
-}
+// ── Adapter ───────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct RpcNotification {
-    jsonrpc: &'static str,
-    method: &'static str,
-    params: Value,
-}
-
-#[derive(Deserialize, Debug)]
-struct RpcMessage {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: Option<String>,
-    params: Option<Value>,
-    result: Option<Value>,
-    #[allow(dead_code)]
-    error: Option<Value>,
-}
-
-/// Coalescing queue for `textDocument/didChange`. Holds only the
-/// latest pending payload — subsequent edits overwrite earlier ones
-/// before the dispatcher serializes + sends to the LSP. Avoids a
-/// fast-typing user piling N full-buffer payloads in front of a
-/// hover / completion request.
-struct DidChangeQueue {
-    latest: std::sync::Mutex<Option<(Uri, i32, String)>>,
-    notify: tokio::sync::Notify,
-}
+struct Inner { manager: LspManager }
 
 pub struct LspClient {
-    write_tx: mpsc::Sender<String>,
-    didchange: std::sync::Arc<DidChangeQueue>,
-    _child: Child,
+    inner: Arc<Inner>,
     pub events: mpsc::Receiver<LspEvent>,
 }
 
 impl LspClient {
-    pub async fn start(
-        binary: &str,
-        root_uri: Option<Uri>,
-        args: &[String],
-    ) -> anyhow::Result<Self> {
-        let mut child = Command::new(binary)
+    pub async fn start(binary: &str, _root_uri: Option<Uri>, args: &[String]) -> anyhow::Result<Self> {
+        // Probe binary availability early (matches old behaviour).
+        std::process::Command::new(binary)
             .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            // SIGKILL the server if we drop the handle without explicit
-            // shutdown — prevents orphaned sqls processes on crash / kill.
-            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
+            .map(|mut c| { let _ = c.kill(); })
             .with_context(|| format!("failed to spawn LSP: {binary}"))?;
 
-        let stdin = child.stdin.take().context("no stdin")?;
-        let stdout = child.stdout.take().context("no stdout")?;
-
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let (write_tx, write_rx) = mpsc::channel::<String>(64);
-
-        let didchange = std::sync::Arc::new(DidChangeQueue {
-            latest: std::sync::Mutex::new(None),
-            notify: tokio::sync::Notify::new(),
+        let mut servers = std::collections::HashMap::new();
+        servers.insert("sql".to_string(), ServerConfig {
+            command: binary.to_string(),
+            args: args.to_vec(),
+            root_markers: vec![],
+            shutdown_idle_after_secs: 0,
         });
-
-        tokio::spawn(read_loop(BufReader::new(stdout), event_tx));
-        tokio::spawn(write_loop(stdin, write_rx));
-        tokio::spawn(didchange_dispatcher(didchange.clone(), write_tx.clone()));
-
-        let mut client = Self {
-            write_tx,
-            didchange,
-            _child: child,
-            events: event_rx,
-        };
-
-        client.initialize(root_uri).await?;
-        Ok(client)
-    }
-
-    async fn initialize(&mut self, root_uri: Option<Uri>) -> anyhow::Result<()> {
-        let params = InitializeParams {
-            #[allow(deprecated)]
-            root_uri,
-            capabilities: ClientCapabilities {
-                text_document: Some(TextDocumentClientCapabilities {
-                    completion: Some(CompletionClientCapabilities {
-                        completion_item: Some(CompletionItemCapability {
-                            snippet_support: Some(false),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
-                        ..Default::default()
-                    }),
-                    // sqls gates `textDocument/hover` on the client
-                    // advertising the capability; without this the
-                    // server silently drops every hover request.
-                    hover: Some(HoverClientCapabilities {
-                        content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
-                        ..Default::default()
-                    }),
-                    definition: Some(GotoCapability {
-                        dynamic_registration: Some(false),
-                        link_support: Some(true),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        self.request("initialize", serde_json::to_value(params)?)
-            .await?;
-        self.notify("initialized", json!({})).await?;
-        Ok(())
+        let config = LspConfig { enabled: true, servers };
+        let manager = LspManager::spawn(config);
+        let inner = Arc::new(Inner { manager });
+        let (evt_tx, evt_rx) = mpsc::channel::<LspEvent>(64);
+        let mgr_ref = Arc::clone(&inner);
+        std::thread::Builder::new()
+            .name("sqeel-lsp-bridge".to_string())
+            .spawn(move || bridge_loop(&mgr_ref.manager, evt_tx))
+            .context("failed to spawn lsp bridge thread")?;
+        Ok(Self { inner, events: evt_rx })
     }
 
     pub async fn open_document(&mut self, uri: Uri, text: &str) -> anyhow::Result<()> {
-        self.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "sql",
-                    "version": 1,
-                    "text": text
-                }
-            }),
-        )
-        .await
-    }
-
-    pub async fn change_document(
-        &mut self,
-        uri: Uri,
-        version: i32,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        // Hand off to the coalescing queue so a burst of edits
-        // collapses into one notification before sqls sees it.
-        *self.didchange.latest.lock().unwrap() = Some((uri, version, text.to_string()));
-        self.didchange.notify.notify_one();
+        self.inner.manager.attach_buffer(BUF, &uri_to_path(&uri), "sql", text);
         Ok(())
     }
 
-    /// Send a completion request and return the request ID.
-    /// Callers should discard responses whose ID doesn't match the most recently returned ID.
-    pub async fn request_completion(
-        &mut self,
-        uri: Uri,
-        line: u32,
-        col: u32,
-    ) -> anyhow::Result<i64> {
-        self.request(
-            "textDocument/completion",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": col }
-            }),
-        )
-        .await
+    pub async fn change_document(&mut self, _uri: Uri, _version: i32, text: &str) -> anyhow::Result<()> {
+        self.inner.manager.notify_change(BUF, text);
+        Ok(())
     }
 
-    /// Graceful LSP shutdown: `shutdown` request + `exit` notification.
-    /// Follows the shutdown with a short wait so well-behaved servers can
-    /// exit on their own before `kill_on_drop` fires.
     pub async fn shutdown(&mut self) {
-        let _ = self.request("shutdown", Value::Null).await;
-        let _ = self.notify("exit", Value::Null).await;
+        // LspManager::Drop sends ShutdownAll; explicit shutdown requires ownership.
+        // kill_on_drop equivalent: the Inner drop triggers ShutdownAll.
     }
 
-    async fn request(&mut self, method: &'static str, params: Value) -> anyhow::Result<i64> {
-        let id = next_id();
-        let msg = RpcRequest {
-            jsonrpc: "2.0",
-            id,
-            method,
-            params,
-        };
-        self.send(&serde_json::to_string(&msg)?).await?;
-        Ok(id)
-    }
-
-    async fn notify(&mut self, method: &'static str, params: Value) -> anyhow::Result<()> {
-        let msg = RpcNotification {
-            jsonrpc: "2.0",
-            method,
-            params,
-        };
-        self.send(&serde_json::to_string(&msg)?).await
-    }
-
-    async fn send(&mut self, body: &str) -> anyhow::Result<()> {
-        let msg = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        self.write_tx.send(msg).await?;
-        Ok(())
-    }
-
-    /// Clonable write-side handle. Use it to fire-and-forget
-    /// notifications (e.g. `didChange`) from a spawned task so the
-    /// render loop doesn't block on the JSON serialization + channel
-    /// send — which for multi-MB buffers would otherwise block per
-    /// keystroke.
     pub fn writer(&self) -> LspWriter {
-        LspWriter {
-            tx: self.write_tx.clone(),
-            didchange: self.didchange.clone(),
-        }
+        LspWriter { inner: Arc::clone(&self.inner) }
     }
 }
 
-/// Dispatcher loop for the coalesced `didChange` queue. Wakes on
-/// `notify`, drains the slot, serializes the (latest) payload and
-/// pushes the framed RPC into the shared write channel. Multiple
-/// notifications between drains are collapsed — only the most recent
-/// payload reaches the server.
-async fn didchange_dispatcher(queue: std::sync::Arc<DidChangeQueue>, tx: mpsc::Sender<String>) {
-    loop {
-        queue.notify.notified().await;
-        let payload = queue.latest.lock().unwrap().take();
-        let Some((uri, version, text)) = payload else {
-            continue;
-        };
-        let params = json!({
-            "textDocument": { "uri": uri, "version": version },
-            "contentChanges": [{ "text": text }]
-        });
-        let msg = RpcNotification {
-            jsonrpc: "2.0",
-            method: "textDocument/didChange",
-            params,
-        };
-        if let Ok(body) = serde_json::to_string(&msg) {
-            let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-            if tx.send(framed).await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-/// Cheap cloneable write-side of an [`LspClient`]. Doesn't hold any
-/// `&mut` reference so the caller can move it into a spawned task and
-/// fire notifications off the render loop. Sends drop silently if the
-/// owning client has been dropped (e.g. LSP restart SIGKILLed the
-/// previous child) — the caller doesn't need to observe the error.
 #[derive(Clone)]
-pub struct LspWriter {
-    tx: mpsc::Sender<String>,
-    didchange: std::sync::Arc<DidChangeQueue>,
-}
+pub struct LspWriter { inner: Arc<Inner> }
 
 impl LspWriter {
-    pub async fn change_document(&self, uri: Uri, version: i32, text: &str) -> anyhow::Result<()> {
-        // Coalesce: stash the latest payload + ping the dispatcher.
-        // A queued didChange waiting in the slot gets overwritten
-        // before it ever reaches the wire, so fast-typing doesn't
-        // pile multi-MB serializations behind a hover request.
-        *self.didchange.latest.lock().unwrap() = Some((uri, version, text.to_string()));
-        self.didchange.notify.notify_one();
+    pub async fn change_document(&self, _uri: Uri, _version: i32, text: &str) -> anyhow::Result<()> {
+        self.inner.manager.notify_change(BUF, text);
         Ok(())
     }
 
-    /// Fire-and-forget completion request. Returns the request ID
-    /// synchronously (derived from the shared counter) so the caller
-    /// can use it to dedupe late responses. The serialize + mpsc send
-    /// run on a spawned task, so a slow writer channel doesn't stall
-    /// the render loop.
     pub fn request_completion(&self, uri: Uri, line: u32, col: u32) -> i64 {
         let id = next_id();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": col }
-            });
-            let msg = RpcRequest {
-                jsonrpc: "2.0",
-                id,
-                method: "textDocument/completion",
-                params,
-            };
-            if let Ok(body) = serde_json::to_string(&msg) {
-                let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tx.send(framed).await;
-            }
-        });
+        self.inner.manager.send_request(id, BUF, "textDocument/completion", serde_json::json!({
+            "textDocument": { "uri": uri.as_str() }, "position": { "line": line, "character": col }
+        }));
         id
     }
 
-    /// Fire-and-forget goto-definition request. Response surfaces as
-    /// `LspEvent::Definition(id, uri, line, col)`; caller dedupes by id.
     pub fn request_definition(&self, uri: Uri, line: u32, col: u32) -> i64 {
         let id = next_id();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": col }
-            });
-            let msg = RpcRequest {
-                jsonrpc: "2.0",
-                id,
-                method: "textDocument/definition",
-                params,
-            };
-            if let Ok(body) = serde_json::to_string(&msg) {
-                let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tx.send(framed).await;
-            }
-        });
+        self.inner.manager.send_request(id, BUF, "textDocument/definition", serde_json::json!({
+            "textDocument": { "uri": uri.as_str() }, "position": { "line": line, "character": col }
+        }));
         id
     }
 
-    /// Fire-and-forget hover request. Response surfaces as
-    /// `LspEvent::Hover(id, text)`; caller dedupes by id.
     pub fn request_hover(&self, uri: Uri, line: u32, col: u32) -> i64 {
         let id = next_id();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let params = json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": line, "character": col }
-            });
-            let msg = RpcRequest {
-                jsonrpc: "2.0",
-                id,
-                method: "textDocument/hover",
-                params,
-            };
-            if let Ok(body) = serde_json::to_string(&msg) {
-                let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tx.send(framed).await;
-            }
-        });
+        self.inner.manager.send_request(id, BUF, "textDocument/hover", serde_json::json!({
+            "textDocument": { "uri": uri.as_str() }, "position": { "line": line, "character": col }
+        }));
         id
     }
 }
 
-async fn write_loop(stdin: ChildStdin, mut rx: mpsc::Receiver<String>) {
-    let mut writer = BufWriter::new(stdin);
-    while let Some(msg) = rx.recv().await {
-        if writer.write_all(msg.as_bytes()).await.is_err() {
-            break;
-        }
-        if writer.flush().await.is_err() {
-            break;
-        }
-    }
-}
+// ── Bridge ────────────────────────────────────────────────────────────────────
 
-async fn read_loop(mut reader: BufReader<ChildStdout>, tx: mpsc::Sender<LspEvent>) {
+fn bridge_loop(manager: &LspManager, tx: mpsc::Sender<LspEvent>) {
     loop {
-        let mut header = String::new();
-        let mut content_length: usize = 0;
-
-        loop {
-            header.clear();
-            if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
-                return;
-            }
-            let h = header.trim();
-            if h.is_empty() {
-                break;
-            }
-            if let Some(val) = h.strip_prefix("Content-Length: ") {
-                content_length = val.parse().unwrap_or(0);
-            }
-        }
-
-        if content_length == 0 {
-            continue;
-        }
-
-        let mut body = vec![0u8; content_length];
-        if reader.read_exact(&mut body).await.is_err() {
-            return;
-        }
-
-        let Ok(msg) = serde_json::from_slice::<RpcMessage>(&body) else {
-            continue;
-        };
-
-        if let Some(method) = &msg.method
-            && method.as_str() == "textDocument/publishDiagnostics"
-            && let Some(params) = msg.params
-            && let Ok(p) = serde_json::from_value::<PublishDiagnosticsParams>(params)
-        {
-            let diags = p
-                .diagnostics
-                .into_iter()
-                .map(|d| Diagnostic {
-                    line: d.range.start.line,
-                    col: d.range.start.character,
-                    end_line: d.range.end.line,
-                    end_col: d.range.end.character,
-                    message: d.message,
-                    severity: d.severity.unwrap_or(DiagnosticSeverity::ERROR),
-                })
-                .collect();
-            let _ = tx.send(LspEvent::Diagnostics(diags)).await;
-        }
-
-        if let Some(id_val) = msg.id
-            && let Some(result) = msg.result
-        {
-            let id = match &id_val {
-                Value::Number(n) => n.as_i64().unwrap_or(0),
-                _ => 0,
-            };
-            let debug = std::env::var("SQEEL_DEBUG_HL_DUMP").ok();
-            // Try the Hover shape first — it carries a `contents`
-            // field whose type is distinctive enough that false
-            // positives don't sneak through. Completion responses are
-            // either a raw array or an object with `isIncomplete` +
-            // `items`, neither of which matches. Probing Hover first
-            // keeps hover replies from accidentally being routed
-            // through the Completion branch on servers that return
-            // odd shapes.
-            // GotoDefinition can arrive as Location | [Location] |
-            // [LocationLink] | null. Probe that shape before hover /
-            // completion since its discriminant (`uri` field) is
-            // distinct from either.
-            if let Ok(def) = serde_json::from_value::<GotoDefinitionResponse>(result.clone()) {
-                let loc_opt = match def {
-                    GotoDefinitionResponse::Scalar(loc) => Some((loc.uri, loc.range.start)),
-                    GotoDefinitionResponse::Array(mut locs) => {
-                        locs.pop().map(|loc| (loc.uri, loc.range.start))
-                    }
-                    GotoDefinitionResponse::Link(mut links) => links
-                        .pop()
-                        .map(|l| (l.target_uri, l.target_selection_range.start)),
-                };
-                if let Some((uri, pos)) = loc_opt {
-                    let _ = tx
-                        .send(LspEvent::Definition(
-                            id,
-                            uri.to_string(),
-                            pos.line,
-                            pos.character,
-                        ))
-                        .await;
-                }
-            } else if let Ok(hover) = serde_json::from_value::<Hover>(result.clone()) {
-                if let Some(path) = &debug {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                    {
-                        let _ = writeln!(f, "### lsp hover response id={id}");
-                    }
-                }
-                if let Some(text) = hover_text_from_contents(&hover.contents) {
-                    let _ = tx.send(LspEvent::Hover(id, text)).await;
-                }
-            } else if let Ok(list) = serde_json::from_value::<CompletionResponse>(result) {
-                let items: Vec<String> = match list {
-                    CompletionResponse::Array(items) => {
-                        items.into_iter().map(|i| i.label).collect()
-                    }
-                    CompletionResponse::List(l) => l.items.into_iter().map(|i| i.label).collect(),
-                };
-                let _ = tx.send(LspEvent::Completion(id, items)).await;
-            } else if let Some(path) = &debug {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    let _ = writeln!(f, "### lsp unroutable response id={id}");
+        match manager.try_recv_event() {
+            Some(evt) => {
+                if let Some(e) = translate_event(evt) {
+                    if tx.blocking_send(e).is_err() { break; }
                 }
             }
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
         }
     }
 }
 
-/// Flatten `HoverContents` into a plain display string. sqls returns
-/// markdown — we strip the fences so the popup renders as raw text;
-/// the TUI doesn't carry a markdown renderer. Returns `None` when the
-/// server sent an empty response.
+fn translate_event(evt: HjklLspEvent) -> Option<LspEvent> {
+    match evt {
+        HjklLspEvent::Notification { method, params, .. } if method == "textDocument/publishDiagnostics" => {
+            let p: lsp_types::PublishDiagnosticsParams = serde_json::from_value(params).ok()?;
+            Some(LspEvent::Diagnostics(p.diagnostics.into_iter().map(|d| Diagnostic {
+                line: d.range.start.line, col: d.range.start.character,
+                end_line: d.range.end.line, end_col: d.range.end.character,
+                message: d.message, severity: d.severity.unwrap_or(DiagnosticSeverity::ERROR),
+            }).collect()))
+        }
+        HjklLspEvent::Response { request_id, result: Ok(value) } => translate_response(request_id, value),
+        _ => None,
+    }
+}
+
+fn translate_response(id: i64, result: Value) -> Option<LspEvent> {
+    let debug = std::env::var("SQEEL_DEBUG_HL_DUMP").ok();
+    if let Ok(def) = serde_json::from_value::<GotoDefinitionResponse>(result.clone()) {
+        let loc = match def {
+            GotoDefinitionResponse::Scalar(l) => Some((l.uri, l.range.start)),
+            GotoDefinitionResponse::Array(mut v) => v.pop().map(|l| (l.uri, l.range.start)),
+            GotoDefinitionResponse::Link(mut v) => v.pop().map(|l| (l.target_uri, l.target_selection_range.start)),
+        };
+        if let Some((uri, pos)) = loc {
+            return Some(LspEvent::Definition(id, uri.to_string(), pos.line, pos.character));
+        }
+    }
+    if let Ok(hover) = serde_json::from_value::<Hover>(result.clone()) {
+        if let Some(path) = &debug {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "### lsp hover response id={id}");
+            }
+        }
+        return hover_text_from_contents(&hover.contents).map(|t| LspEvent::Hover(id, t));
+    }
+    if let Ok(list) = serde_json::from_value::<CompletionResponse>(result) {
+        let items: Vec<String> = match list {
+            CompletionResponse::Array(v) => v.into_iter().map(|i| i.label).collect(),
+            CompletionResponse::List(l) => l.items.into_iter().map(|i| i.label).collect(),
+        };
+        return Some(LspEvent::Completion(id, items));
+    }
+    if let Some(path) = &debug {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "### lsp unroutable response id={id}");
+        }
+    }
+    None
+}
+
 fn hover_text_from_contents(contents: &HoverContents) -> Option<String> {
-    fn marked_string_text(m: &MarkedString) -> String {
+    fn ms(m: &MarkedString) -> String {
         match m {
             MarkedString::String(s) => s.clone(),
             MarkedString::LanguageString(ls) => ls.value.clone(),
         }
     }
     let text = match contents {
-        HoverContents::Scalar(s) => marked_string_text(s),
-        HoverContents::Array(items) => items
-            .iter()
-            .map(marked_string_text)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        HoverContents::Scalar(s) => ms(s),
+        HoverContents::Array(items) => items.iter().map(ms).collect::<Vec<_>>().join("\n"),
         HoverContents::Markup(m) => m.value.clone(),
     };
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    let t = text.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
 }
+
+fn uri_to_path(uri: &Uri) -> PathBuf {
+    if let Ok(url) = url::Url::parse(uri.as_str()) {
+        if let Ok(p) = url.to_file_path() { return p; }
+    }
+    let s = uri.as_str();
+    PathBuf::from(s.strip_prefix("file://").unwrap_or(s))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -605,8 +257,7 @@ mod tests {
 
     #[test]
     fn sqls_driver_and_dsn_mysql() {
-        let (driver, dsn) =
-            super::sqls_driver_and_dsn("mysql://root:secret@localhost:3306/mydb").unwrap();
+        let (driver, dsn) = super::sqls_driver_and_dsn("mysql://root:secret@localhost:3306/mydb").unwrap();
         assert_eq!(driver, "mysql");
         assert_eq!(dsn, "root:secret@tcp(localhost:3306)/mydb");
     }
@@ -649,22 +300,15 @@ mod tests {
     #[test]
     fn hover_text_scalar_string_extracted() {
         let contents = HoverContents::Scalar(MarkedString::String("hello".into()));
-        assert_eq!(
-            super::hover_text_from_contents(&contents),
-            Some("hello".into())
-        );
+        assert_eq!(super::hover_text_from_contents(&contents), Some("hello".into()));
     }
 
     #[test]
     fn hover_text_scalar_language_string_extracted() {
         let contents = HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
-            language: "sql".into(),
-            value: "SELECT 1".into(),
+            language: "sql".into(), value: "SELECT 1".into(),
         }));
-        assert_eq!(
-            super::hover_text_from_contents(&contents),
-            Some("SELECT 1".into())
-        );
+        assert_eq!(super::hover_text_from_contents(&contents), Some("SELECT 1".into()));
     }
 
     #[test]
@@ -673,124 +317,20 @@ mod tests {
             MarkedString::String("line1".into()),
             MarkedString::String("line2".into()),
         ]);
-        assert_eq!(
-            super::hover_text_from_contents(&contents),
-            Some("line1\nline2".into())
-        );
+        assert_eq!(super::hover_text_from_contents(&contents), Some("line1\nline2".into()));
     }
 
     #[test]
     fn hover_text_markup_extracted() {
         let contents = HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: "## schema.table".into(),
+            kind: MarkupKind::Markdown, value: "## schema.table".into(),
         });
-        assert_eq!(
-            super::hover_text_from_contents(&contents),
-            Some("## schema.table".into())
-        );
+        assert_eq!(super::hover_text_from_contents(&contents), Some("## schema.table".into()));
     }
 
     #[test]
     fn hover_text_empty_returns_none() {
         let contents = HoverContents::Scalar(MarkedString::String("   ".into()));
         assert_eq!(super::hover_text_from_contents(&contents), None);
-    }
-
-    // Helper: spawn the dispatcher against a fresh queue, return the
-    // queue + the rx end of the write channel so tests can assert on
-    // exactly what reaches the wire.
-    fn spawn_dispatcher() -> (std::sync::Arc<DidChangeQueue>, mpsc::Receiver<String>) {
-        let (tx, rx) = mpsc::channel::<String>(64);
-        let queue = std::sync::Arc::new(DidChangeQueue {
-            latest: std::sync::Mutex::new(None),
-            notify: tokio::sync::Notify::new(),
-        });
-        tokio::spawn(super::didchange_dispatcher(queue.clone(), tx));
-        (queue, rx)
-    }
-
-    fn fake_uri(p: &str) -> Uri {
-        use std::str::FromStr;
-        Uri::from_str(p).unwrap()
-    }
-
-    /// Pull the `version` and a chunk of the text out of a framed RPC
-    /// payload — keeps assertions small without serde-deserialising
-    /// the whole envelope back.
-    fn parse_version_and_text(framed: &str) -> (i32, String) {
-        let body = framed.split("\r\n\r\n").nth(1).expect("framed body");
-        let v: serde_json::Value = serde_json::from_str(body).expect("json body");
-        let version = v["params"]["textDocument"]["version"].as_i64().unwrap() as i32;
-        let text = v["params"]["contentChanges"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        (version, text)
-    }
-
-    #[tokio::test]
-    async fn didchange_dispatcher_collapses_burst_to_latest() {
-        let (queue, mut rx) = spawn_dispatcher();
-        let uri = fake_uri("file:///t.sql");
-        // Push 10 payloads back-to-back without giving the
-        // dispatcher a chance to drain in between. The slot
-        // overwrites each prior pending value, so when the
-        // dispatcher wakes it should see only the final one.
-        for i in 1..=10 {
-            *queue.latest.lock().unwrap() = Some((uri.clone(), i, format!("v{i}")));
-            queue.notify.notify_one();
-        }
-        // Give the dispatcher tokio time to drain.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let mut received: Vec<(i32, String)> = Vec::new();
-        while let Ok(framed) = rx.try_recv() {
-            received.push(parse_version_and_text(&framed));
-        }
-        assert!(!received.is_empty(), "dispatcher sent nothing");
-        // The very last received message must carry the latest
-        // version regardless of how many intermediate ones snuck
-        // through (most bursts collapse to a single send).
-        let (last_v, last_text) = received.last().unwrap();
-        assert_eq!(*last_v, 10);
-        assert_eq!(last_text, "v10");
-        assert!(
-            received.len() <= 10,
-            "received {} messages, expected coalesce",
-            received.len()
-        );
-    }
-
-    #[tokio::test]
-    async fn didchange_dispatcher_skips_when_slot_taken_then_emptied() {
-        let (queue, mut rx) = spawn_dispatcher();
-        // Notify with no payload — dispatcher wakes, finds slot
-        // empty, loops back without sending. Mirrors the rare race
-        // where a notify lands after another consumer drained.
-        queue.notify.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(rx.try_recv().is_err(), "dispatcher sent on empty slot");
-    }
-
-    #[tokio::test]
-    async fn didchange_dispatcher_emits_subsequent_writes() {
-        let (queue, mut rx) = spawn_dispatcher();
-        let uri = fake_uri("file:///t.sql");
-        // First write.
-        *queue.latest.lock().unwrap() = Some((uri.clone(), 1, "first".into()));
-        queue.notify.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let first = rx.try_recv().expect("first write delivered");
-        let (v1, t1) = parse_version_and_text(&first);
-        assert_eq!(v1, 1);
-        assert_eq!(t1, "first");
-        // Later, an unrelated edit. Dispatcher must wake again.
-        *queue.latest.lock().unwrap() = Some((uri.clone(), 2, "second".into()));
-        queue.notify.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let second = rx.try_recv().expect("second write delivered");
-        let (v2, t2) = parse_version_and_text(&second);
-        assert_eq!(v2, 2);
-        assert_eq!(t2, "second");
     }
 }
