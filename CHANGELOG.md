@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-05-13
+
+### Changed
+
+- **LSP client ported to the shared `hjkl-lsp` crate.** Replaced 796 LOC of
+  hand-rolled codec / server-lifecycle / text-sync plumbing with a 253-LOC thin
+  adapter over `hjkl_lsp::LspManager`. Public surface unchanged — `LspClient`,
+  `LspWriter`, `LspEvent`, `Diagnostic`, `write_sqls_config` keep identical
+  signatures; consumers (`sqeel-tui`) recompile untouched. (kryptic-sh/sqeel#12)
+- Internal `DidChangeQueue` dispatcher tests dropped — the queue is now
+  hjkl-lsp's responsibility. All public-API tests retained.
+
+### Added
+
+- `hjkl-bonsai` `CommentMarkerPass` integration: TODO / FIXME / NOTE / WARN / X
+  markers in SQL comments now highlight via the shared bonsai pass instead of a
+  bespoke overlay. (kryptic-sh/sqeel#8)
+- README module table and key-type reference.
+
+### Fixed
+
+- Clippy `collapsible_if` warnings in the new LSP adapter.
+
 ## [0.4.1] - 2026-05-07
 
 ### Changed
@@ -168,7 +191,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.2
 [0.4.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.0
 [0.3.1]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.3.1
