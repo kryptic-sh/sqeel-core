@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-05-15
+
+### Added
+
+- **Password field in connection form state.** `AppState` gains
+  `add_connection_password: String` and `add_connection_password_cursor: usize`.
+  `AddConnectionField` enum gains the `Password` variant; Tab now cycles
+  `Name → Url → Password → Name`. `open_add_connection`, `open_edit_connection`,
+  and `close_add_connection` clear the new fields on every open/close.
+- **Keyring-aware save.** `save_new_connection` extracts the password from the
+  new field and passes it as `Option<&str>` to `sqeel_config::save_connection`,
+  which handles keyring storage and URL stripping. The old plaintext-password
+  warning toast now only fires when the URL itself contains an inline password
+  and the Password field was left blank; the message includes a
+  `:migrate-secrets` hint. (kryptic-sh/sqeel#26)
+- Bumped `sqeel-config` dependency to `"0.2"` (picks up 0.2.6 keyring APIs).
+
 ## [0.4.9] - 2026-05-15
 
 ### Changed
@@ -264,7 +281,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.9...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.10...HEAD
+[0.4.10]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.10
 [0.4.9]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.9
 [0.4.8]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.8
 [0.4.7]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.7

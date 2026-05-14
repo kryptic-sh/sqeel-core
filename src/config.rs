@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 // (`sqeel_core::config::MainConfig`, `sqeel_core::config::ConnectionConfig`, etc.)
 // continue to work without any changes.
 pub use sqeel_config::{
-    ConnectionConfig, DEFAULTS_TOML, EditorConfig, KeybindingMode, MainConfig, config_dir,
-    delete_connection, load_connections, load_main_config, save_connection,
-    set_config_dir_override,
+    ConnectionConfig, DEFAULTS_TOML, EditorConfig, KeybindingMode, MainConfig, MigrationResult,
+    config_dir, delete_connection, delete_keyring_entry, load_connections, load_main_config,
+    migrate_connection_to_keyring, save_connection, set_config_dir_override,
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]

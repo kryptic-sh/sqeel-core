@@ -160,6 +160,7 @@ pub enum AddConnectionField {
     #[default]
     Name,
     Url,
+    Password,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,10 +501,15 @@ pub struct AppState {
     pub show_add_connection: bool,
     pub add_connection_name: String,
     pub add_connection_url: String,
+    /// Password field in the add/edit connection dialog. Stored in plain
+    /// text in memory only; never written to TOML — sent to keyring on save.
+    pub add_connection_password: String,
     pub add_connection_field: AddConnectionField,
     /// Caret position (char index) within the active add-connection field.
     pub add_connection_name_cursor: usize,
     pub add_connection_url_cursor: usize,
+    /// Caret position within the password field.
+    pub add_connection_password_cursor: usize,
     /// Validation / save error to render inside the add/edit
     /// connection popup. Cleared when the popup is opened, when the
     /// user edits any field (so the message doesn't outlive the
@@ -2876,8 +2882,10 @@ impl AppState {
         self.show_add_connection = true;
         self.add_connection_name.clear();
         self.add_connection_url.clear();
+        self.add_connection_password.clear();
         self.add_connection_name_cursor = 0;
         self.add_connection_url_cursor = 0;
+        self.add_connection_password_cursor = 0;
         self.add_connection_field = AddConnectionField::Name;
         self.add_connection_error = None;
         self.edit_connection_original_name = None;
@@ -2895,8 +2903,10 @@ impl AppState {
         self.show_add_connection = true;
         self.add_connection_name = conn.name.clone();
         self.add_connection_url = conn.url.clone();
+        self.add_connection_password.clear();
         self.add_connection_name_cursor = self.add_connection_name.chars().count();
         self.add_connection_url_cursor = self.add_connection_url.chars().count();
+        self.add_connection_password_cursor = 0;
         self.add_connection_field = AddConnectionField::Name;
         self.add_connection_error = None;
         self.edit_connection_original_name = Some(conn.name);
@@ -2907,6 +2917,8 @@ impl AppState {
         self.show_add_connection = false;
         self.add_connection_error = None;
         self.edit_connection_original_name = None;
+        self.add_connection_password.clear();
+        self.add_connection_password_cursor = 0;
     }
 
     /// Drop any in-flight delete arming and clear its status hint.
@@ -2929,7 +2941,8 @@ impl AppState {
     pub fn add_connection_tab(&mut self) {
         self.add_connection_field = match self.add_connection_field {
             AddConnectionField::Name => AddConnectionField::Url,
-            AddConnectionField::Url => AddConnectionField::Name,
+            AddConnectionField::Url => AddConnectionField::Password,
+            AddConnectionField::Password => AddConnectionField::Name,
         };
     }
 
@@ -2942,6 +2955,10 @@ impl AppState {
             AddConnectionField::Url => (
                 &mut self.add_connection_url,
                 &mut self.add_connection_url_cursor,
+            ),
+            AddConnectionField::Password => (
+                &mut self.add_connection_password,
+                &mut self.add_connection_password_cursor,
             ),
         }
     }
@@ -3025,6 +3042,12 @@ impl AppState {
     pub fn save_new_connection(&mut self) -> anyhow::Result<()> {
         let name = self.add_connection_name.trim().to_string();
         let url = self.add_connection_url.trim().to_string();
+        let password = self.add_connection_password.trim().to_string();
+        let password_opt: Option<&str> = if password.is_empty() {
+            None
+        } else {
+            Some(&password)
+        };
         if name.is_empty() || url.is_empty() {
             anyhow::bail!("Name and URL are required");
         }
@@ -3037,8 +3060,9 @@ impl AppState {
             if *original != name {
                 crate::config::delete_connection(original)?;
             }
-            crate::config::save_connection(&name, &url)?;
-            // Update in-memory entry
+            crate::config::save_connection(&name, &url, password_opt)?;
+            // Update in-memory entry. Store the URL as-is; the keyring
+            // splice happens at load_connections() time on next startup.
             if let Some(entry) = self
                 .available_connections
                 .iter_mut()
@@ -3048,7 +3072,7 @@ impl AppState {
                 entry.url = url.clone();
             }
         } else {
-            crate::config::save_connection(&name, &url)?;
+            crate::config::save_connection(&name, &url, password_opt)?;
             self.available_connections
                 .push(crate::config::ConnectionConfig {
                     name: name.clone(),
@@ -3057,6 +3081,8 @@ impl AppState {
         }
         self.show_add_connection = false;
         self.edit_connection_original_name = None;
+        self.add_connection_password.clear();
+        self.add_connection_password_cursor = 0;
         // First-run / no-active-connection auto-connect: when the
         // user just created a new connection and isn't already
         // attached to anything, kick off the handshake so they
@@ -3073,13 +3099,14 @@ impl AppState {
             self.pending_reconnect = Some(url.clone());
             self.set_status(format!("Connecting to {name}…"));
         }
-        // Plaintext-password heads-up. Save still succeeded; just
-        // surface the risk in the status bar.
-        if url_has_plaintext_password(&url) {
+        // Plaintext-password heads-up when the URL itself still carries a
+        // password (e.g. user typed it directly into the URL field and did
+        // not fill in the separate Password field).
+        // When the Password field was used, save_connection already stripped it.
+        if url_has_plaintext_password(&url) && password_opt.is_none() {
             self.set_status(format!(
-                "⚠ password stored in plaintext at ~/.config/sqeel/conns/{name}.toml — chmod 0600 or use `{}://user@host`",
-                url.split_once(':').map(|(s, _)| s).unwrap_or("scheme"),
-            ));
+                "⚠ password in URL stored at ~/.config/sqeel/conns/{name}.toml — use the Password field or run :migrate-secrets",
+                ));
         }
         Ok(())
     }
