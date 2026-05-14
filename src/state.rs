@@ -2805,6 +2805,65 @@ impl AppState {
         true
     }
 
+    /// Bust the schema TTL cache and immediately re-fetch everything that was
+    /// previously loaded in this session. Unlike `retry_connection` this does
+    /// NOT re-open the DB pool — it only clears the timestamp fields so the
+    /// existing lazy-load path re-fetches on the next tick.
+    ///
+    /// Returns `true` when a refresh was queued (active connection exists);
+    /// `false` when there is nothing to refresh (no connection / no channel).
+    pub fn refresh_schema(&mut self) -> bool {
+        // No connection open yet → nothing to refresh.
+        if self.active_connection.is_none() || self.schema_load_tx.is_none() {
+            return false;
+        }
+
+        // Invalidate the root timestamp so the Databases list is refetched.
+        self.databases_loaded_at = None;
+
+        // Walk the tree: clear timestamps on nodes that were previously
+        // fetched. We only bust already-loaded subtrees (same policy as
+        // `refresh_stale_schema`) — don't preemptively load tables/columns
+        // the user has never expanded.
+        for node in self.schema_nodes.iter_mut() {
+            if let SchemaNode::Database {
+                tables_loaded_at,
+                tables,
+                ..
+            } = node
+            {
+                if tables_loaded_at.is_some() {
+                    *tables_loaded_at = None;
+                }
+                for t in tables.iter_mut() {
+                    if let SchemaNode::Table {
+                        columns_loaded_at, ..
+                    } = t
+                        && columns_loaded_at.is_some()
+                    {
+                        *columns_loaded_at = None;
+                    }
+                }
+            }
+        }
+
+        // Now fire the load requests — the channel + inflight dedup logic
+        // in `request_schema_load` handles the rest.
+        self.request_schema_load(SchemaLoadRequest::Databases);
+        let dbs: Vec<String> = self
+            .schema_nodes
+            .iter()
+            .filter_map(|n| match n {
+                SchemaNode::Database { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        for db in dbs {
+            self.request_schema_load(SchemaLoadRequest::Tables { db });
+        }
+        true
+    }
+
     pub fn open_add_connection(&mut self) {
         self.show_add_connection = true;
         self.add_connection_name.clear();
@@ -4301,6 +4360,69 @@ trailing prose ignored";
 
         s.refresh_stale_schema();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn refresh_schema_returns_false_without_connection() {
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        // active_connection is None by default → no-op.
+        assert!(!s.refresh_schema());
+    }
+
+    #[test]
+    fn refresh_schema_busts_timestamps_and_fires_requests() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        s.active_connection = Some("test_conn".into());
+        s.schema_load_tx = Some(tx);
+        s.set_schema_nodes(sample_schema());
+        s.schema_loads_inflight.clear();
+        s.schema_pending_loads = 0;
+
+        let triggered = s.refresh_schema();
+        assert!(triggered, "should return true when connection is active");
+
+        // databases_loaded_at must have been cleared (None).
+        assert!(
+            s.databases_loaded_at.is_none(),
+            "databases_loaded_at must be None after refresh_schema"
+        );
+
+        // tables_loaded_at on deepci_maindb was Some → must now be None.
+        let db_node = s
+            .schema_nodes
+            .iter()
+            .find(|n| n.name() == "deepci_maindb")
+            .unwrap();
+        if let SchemaNode::Database {
+            tables_loaded_at, ..
+        } = db_node
+        {
+            assert!(
+                tables_loaded_at.is_none(),
+                "tables_loaded_at must be cleared"
+            );
+        } else {
+            panic!("expected Database node");
+        }
+
+        // Channel must have received at least a Databases request.
+        let mut got = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            got.push(req);
+        }
+        assert!(
+            got.contains(&SchemaLoadRequest::Databases),
+            "must fire Databases request"
+        );
+        assert!(
+            got.contains(&SchemaLoadRequest::Tables {
+                db: "deepci_maindb".into()
+            }),
+            "must fire Tables request for deepci_maindb"
+        );
     }
 
     #[test]
