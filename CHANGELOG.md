@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-05-15
+
+### Changed
+
+- **`query_history` field type changed from `Vec<String>` to
+  `Vec<HistoryEntry>`**. `HistoryEntry { query: String, timestamp: SystemTime }`
+  pairs each recorded query with a wall-clock timestamp. `push_history` stamps
+  `SystemTime::now()` on insertion; `history_prev` / `history_next` return
+  `Option<&str>` over `entry.query` — external call-site contract unchanged.
+  Backs the `<leader>h` history picker in sqeel-tui. (#17)
+
 ## [0.4.5] - 2026-05-15
 
 ### Added
@@ -220,7 +231,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.6
 [0.4.5]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.5
 [0.4.4]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.4
 [0.4.3]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.3

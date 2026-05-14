@@ -13,7 +13,7 @@ use lsp_types::DiagnosticSeverity;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 impl AppState {
     /// True iff a single query or batch is currently running against
@@ -341,6 +341,14 @@ pub enum SchemaLoadRequest {
     Columns { db: String, table: String },
 }
 
+/// A single entry in the query history, with its original content and a wall-clock
+/// timestamp so the TUI picker can display relative ages ("2m ago", "yesterday").
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEntry {
+    pub query: String,
+    pub timestamp: SystemTime,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub editor_content: Arc<String>,
@@ -476,7 +484,7 @@ pub struct AppState {
     /// main loop from spawning duplicate rebuilds while one is running
     /// against a now-stale snapshot.
     pub schema_rebuild_in_flight: bool,
-    pub query_history: Vec<String>,
+    pub query_history: Vec<HistoryEntry>,
     pub history_cursor: Option<usize>,
     // Connection switcher
     pub available_connections: Vec<ConnectionConfig>,
@@ -3525,8 +3533,11 @@ impl AppState {
         if trimmed.is_empty() {
             return;
         }
-        if self.query_history.last().map(|s| s.as_str()) != Some(&trimmed) {
-            self.query_history.push(trimmed);
+        if self.query_history.last().map(|e| e.query.as_str()) != Some(&trimmed) {
+            self.query_history.push(HistoryEntry {
+                query: trimmed,
+                timestamp: SystemTime::now(),
+            });
         }
         if self.query_history.len() > 100 {
             self.query_history.remove(0);
@@ -3546,7 +3557,7 @@ impl AppState {
             Some(i) => i - 1,
         };
         self.history_cursor = Some(idx);
-        self.query_history.get(idx).map(|s| s.as_str())
+        self.query_history.get(idx).map(|e| e.query.as_str())
     }
 
     /// Move cursor forward in history; returns None when past the end.
@@ -3557,7 +3568,7 @@ impl AppState {
             return None;
         }
         self.history_cursor = Some(idx);
-        self.query_history.get(idx).map(|s| s.as_str())
+        self.query_history.get(idx).map(|e| e.query.as_str())
     }
 }
 
@@ -4016,6 +4027,8 @@ trailing prose ignored";
         s.push_history("SELECT 2");
         s.push_history("SELECT 3");
         assert_eq!(s.query_history.len(), 3);
+        // Each entry has a query string and a timestamp.
+        assert!(s.query_history.iter().all(|e| !e.query.is_empty()));
         assert_eq!(s.history_prev(), Some("SELECT 3"));
         assert_eq!(s.history_prev(), Some("SELECT 2"));
         assert_eq!(s.history_prev(), Some("SELECT 1"));
@@ -4046,6 +4059,11 @@ trailing prose ignored";
             s.push_history(&format!("SELECT {i}"));
         }
         assert_eq!(s.query_history.len(), 100);
+        // Oldest entries evicted; last entry is SELECT 109.
+        assert_eq!(
+            s.query_history.last().map(|e| e.query.as_str()),
+            Some("SELECT 109")
+        );
     }
 
     fn sample_schema() -> Vec<SchemaNode> {
