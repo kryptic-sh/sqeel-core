@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-05-15
+
+### Added
+
+- `AppState::refresh_schema()` — busts the schema TTL cache and re-fires
+  `request_schema_load` for previously-loaded subtrees without re-opening the DB
+  pool. Returns `true` when a refresh was queued, `false` when no connection is
+  active. Backs sqeel-tui's `:refreshschema` / `<leader>R` binding. (#18)
+
 ## [0.4.4] - 2026-05-14
 
 ### Changed
@@ -211,7 +220,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.5
 [0.4.4]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.4
 [0.4.3]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.3
 [0.4.2]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.2
