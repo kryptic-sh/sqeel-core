@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-05-15
+
+### Changed
+
+- Bumped `hjkl-engine` dependency from 0.6 to 0.7. Re-exported
+  `{KeybindingMode, VimMode}` now resolve to engine 0.7. Tracks the engine churn
+  — `hjkl-form 0.3.7` caret-minor-bumped its engine pin to 0.7, dragging two
+  engine majors into any consumer graph still on 0.6. Requires
+  `sqeel-config = 0.2.5`.
+
 ## [0.4.8] - 2026-05-15
 
 ### Added
@@ -254,7 +264,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.9
 [0.4.8]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.8
 [0.4.7]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.7
 [0.4.6]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.6
