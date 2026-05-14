@@ -3329,15 +3329,23 @@ impl AppState {
     }
 
     pub fn new_tab(&mut self) {
-        // Save current tab content before leaving
+        self.new_tab_with_content(String::new());
+    }
+
+    /// Create a fresh scratch tab pre-seeded with `content`. The scratch file
+    /// on disk is written with the same content so `:w` is a no-op rather
+    /// than a surprising overwrite. Used by the `<leader>h` history picker
+    /// so the picked query lands in its own tab instead of clobbering the
+    /// active buffer.
+    pub fn new_tab_with_content(&mut self, content: String) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.content = Some((*self.editor_content).clone());
         }
         if let Ok(name) = persistence::next_scratch_name() {
-            let _ = persistence::save_query(&name, "");
-            self.tabs.push(TabEntry::open(name, String::new()));
+            let _ = persistence::save_query(&name, &content);
+            self.tabs.push(TabEntry::open(name, content.clone()));
             self.active_tab = self.tabs.len() - 1;
-            self.tab_content_pending = Some(String::new());
+            self.tab_content_pending = Some(content);
         }
     }
 

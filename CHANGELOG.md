@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-05-15
+
+### Added
+
+- **`AppState::new_tab_with_content(content: String)`** — fresh scratch tab
+  pre-seeded with the given content (disk + memory + `tab_content_pending`
+  consistent). Backs sqeel-tui's `<leader>h` history-picker UX fix: a picked
+  history entry now lands in its own tab instead of clobbering the active buffer
+  with no tab-bar update. `new_tab()` is now a thin wrapper around
+  `new_tab_with_content(String::new())`.
+
 ## [0.4.7] - 2026-05-15
 
 ### Fixed
@@ -243,7 +254,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.8
 [0.4.7]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.7
 [0.4.6]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.6
 [0.4.5]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.5
