@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-05-15
+
+### Fixed
+
+- **CI: pin `toolchain: stable` + add `rustup update --no-self-update stable`
+  step after `actions-rust-lang/setup-rust-toolchain@v1`.** The new action reads
+  the repo's `rust-toolchain.toml` (`channel = "stable"`) but reuses the
+  runner's pre-cached rustc 1.94.1 — `cargo` then rejects building against deps
+  that pin `rust-version = "1.95"`. The explicit `rustup update` step forces a
+  fresh stable install. v0.4.6 was tagged but failed to publish for this reason;
+  same content ships here.
+
 ## [0.4.6] - 2026-05-15
 
 ### Changed
@@ -231,7 +243,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.7
 [0.4.6]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.6
 [0.4.5]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.5
 [0.4.4]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.4
