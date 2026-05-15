@@ -29,6 +29,14 @@ pub fn write_sqls_config(url: &str) -> anyhow::Result<PathBuf> {
     );
     let path = std::env::temp_dir().join(format!("sqeel-sqls-config-{}.yml", std::process::id()));
     std::fs::write(&path, yaml)?;
+    // Restrict read access to the owner: the config contains database credentials.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    // On Windows, %TEMP% ACLs already restrict access to the creating user,
+    // so no additional permission step is needed there.
     Ok(path)
 }
 
@@ -216,7 +224,10 @@ fn bridge_loop(manager: &LspManager, tx: mpsc::Sender<LspEvent>) {
                     break;
                 }
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            // 10 ms: 10× fewer syscalls than 1 ms, still well under a UI frame
+            // budget (~16 ms for 60 Hz). The upstream LspManager only exposes
+            // try_recv_event(), so polling is the only option here.
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     }
 }
