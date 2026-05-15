@@ -161,6 +161,22 @@ pub enum AddConnectionField {
     Name,
     Url,
     Password,
+    /// Path to a PEM-encoded CA root certificate.
+    CaCert,
+    /// Path to a PEM-encoded client certificate (mutual TLS).
+    ClientCert,
+    /// Path to the private key matching `ClientCert`.
+    ClientKey,
+    /// Toggle between `Full` and `Skip` certificate verification.
+    VerifyMode,
+}
+
+/// Returns `true` when `url`'s scheme is one that supports TLS configuration
+/// (mysql, mariadb, postgres, postgresql). SQLite and DuckDB don't have
+/// network TLS, so we skip the TLS fields for those schemes.
+pub(crate) fn url_supports_tls(url: &str) -> bool {
+    let scheme = url.split(':').next().unwrap_or("");
+    matches!(scheme, "mysql" | "mariadb" | "postgres" | "postgresql")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +527,18 @@ pub struct AppState {
     pub add_connection_url_cursor: usize,
     /// Caret position within the password field.
     pub add_connection_password_cursor: usize,
+    /// Path to a PEM-encoded CA root certificate (TLS field).
+    pub add_connection_ca_cert: String,
+    pub add_connection_ca_cert_cursor: usize,
+    /// Path to a PEM-encoded client certificate for mutual TLS.
+    pub add_connection_client_cert: String,
+    pub add_connection_client_cert_cursor: usize,
+    /// Path to the private key matching `add_connection_client_cert`.
+    pub add_connection_client_key: String,
+    pub add_connection_client_key_cursor: usize,
+    /// TLS certificate verification mode toggle (no cursor — it's a toggle).
+    /// Defaults to `Full`. Only relevant when the URL scheme supports TLS.
+    pub add_connection_verify_mode: sqeel_config::TlsVerifyMode,
     /// Validation / save error to render inside the add/edit
     /// connection popup. Cleared when the popup is opened, when the
     /// user edits any field (so the message doesn't outlive the
@@ -2894,6 +2922,13 @@ impl AppState {
         self.add_connection_name_cursor = 0;
         self.add_connection_url_cursor = 0;
         self.add_connection_password_cursor = 0;
+        self.add_connection_ca_cert.clear();
+        self.add_connection_ca_cert_cursor = 0;
+        self.add_connection_client_cert.clear();
+        self.add_connection_client_cert_cursor = 0;
+        self.add_connection_client_key.clear();
+        self.add_connection_client_key_cursor = 0;
+        self.add_connection_verify_mode = sqeel_config::TlsVerifyMode::Full;
         self.add_connection_field = AddConnectionField::Name;
         self.add_connection_error = None;
         self.edit_connection_original_name = None;
@@ -2915,6 +2950,38 @@ impl AppState {
         self.add_connection_name_cursor = self.add_connection_name.chars().count();
         self.add_connection_url_cursor = self.add_connection_url.chars().count();
         self.add_connection_password_cursor = 0;
+        // Populate TLS fields from the existing connection config.
+        if let Some(tls) = &conn.tls {
+            self.add_connection_ca_cert = tls
+                .ca_cert
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            self.add_connection_ca_cert_cursor = self.add_connection_ca_cert.chars().count();
+            self.add_connection_client_cert = tls
+                .client_cert
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            self.add_connection_client_cert_cursor =
+                self.add_connection_client_cert.chars().count();
+            self.add_connection_client_key = tls
+                .client_key
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            self.add_connection_client_key_cursor = self.add_connection_client_key.chars().count();
+            self.add_connection_verify_mode =
+                tls.verify_mode.unwrap_or(sqeel_config::TlsVerifyMode::Full);
+        } else {
+            self.add_connection_ca_cert.clear();
+            self.add_connection_ca_cert_cursor = 0;
+            self.add_connection_client_cert.clear();
+            self.add_connection_client_cert_cursor = 0;
+            self.add_connection_client_key.clear();
+            self.add_connection_client_key_cursor = 0;
+            self.add_connection_verify_mode = sqeel_config::TlsVerifyMode::Full;
+        }
         self.add_connection_field = AddConnectionField::Name;
         self.add_connection_error = None;
         self.edit_connection_original_name = Some(conn.name);
@@ -2947,10 +3014,30 @@ impl AppState {
     }
 
     pub fn add_connection_tab(&mut self) {
+        let tls_supported = url_supports_tls(&self.add_connection_url);
         self.add_connection_field = match self.add_connection_field {
             AddConnectionField::Name => AddConnectionField::Url,
             AddConnectionField::Url => AddConnectionField::Password,
-            AddConnectionField::Password => AddConnectionField::Name,
+            AddConnectionField::Password => {
+                if tls_supported {
+                    AddConnectionField::CaCert
+                } else {
+                    AddConnectionField::Name
+                }
+            }
+            AddConnectionField::CaCert => AddConnectionField::ClientCert,
+            AddConnectionField::ClientCert => AddConnectionField::ClientKey,
+            AddConnectionField::ClientKey => AddConnectionField::VerifyMode,
+            AddConnectionField::VerifyMode => AddConnectionField::Name,
+        };
+    }
+
+    /// Toggle the `VerifyMode` field between `Full` and `Skip`.
+    /// Only meaningful when `add_connection_field == VerifyMode`.
+    pub fn add_connection_toggle_verify_mode(&mut self) {
+        self.add_connection_verify_mode = match self.add_connection_verify_mode {
+            sqeel_config::TlsVerifyMode::Full => sqeel_config::TlsVerifyMode::Skip,
+            sqeel_config::TlsVerifyMode::Skip => sqeel_config::TlsVerifyMode::Full,
         };
     }
 
@@ -2967,6 +3054,26 @@ impl AppState {
             AddConnectionField::Password => (
                 &mut self.add_connection_password,
                 &mut self.add_connection_password_cursor,
+            ),
+            AddConnectionField::CaCert => (
+                &mut self.add_connection_ca_cert,
+                &mut self.add_connection_ca_cert_cursor,
+            ),
+            AddConnectionField::ClientCert => (
+                &mut self.add_connection_client_cert,
+                &mut self.add_connection_client_cert_cursor,
+            ),
+            AddConnectionField::ClientKey => (
+                &mut self.add_connection_client_key,
+                &mut self.add_connection_client_key_cursor,
+            ),
+            // VerifyMode is a toggle — fall back to the Name field so text
+            // operations (type_char, backspace, etc.) are no-ops when the
+            // toggle is focused. The TUI should route Space/Enter to
+            // `add_connection_toggle_verify_mode` instead.
+            AddConnectionField::VerifyMode => (
+                &mut self.add_connection_name,
+                &mut self.add_connection_name_cursor,
             ),
         }
     }
@@ -3046,6 +3153,45 @@ impl AppState {
         *cur = text.chars().count();
     }
 
+    /// Build the `TlsConfig` from the current form state, or `None` when the
+    /// URL scheme doesn't support TLS or no TLS fields are filled in.
+    fn build_tls_config(&self, url: &str) -> Option<sqeel_config::TlsConfig> {
+        if !url_supports_tls(url) {
+            return None;
+        }
+        let ca_cert = self.add_connection_ca_cert.trim();
+        let client_cert = self.add_connection_client_cert.trim();
+        let client_key = self.add_connection_client_key.trim();
+        let verify_mode = self.add_connection_verify_mode;
+        // If everything is empty and verify_mode is Full (the default), no TLS
+        // override is needed — let the driver choose.
+        if ca_cert.is_empty()
+            && client_cert.is_empty()
+            && client_key.is_empty()
+            && verify_mode == sqeel_config::TlsVerifyMode::Full
+        {
+            return None;
+        }
+        Some(sqeel_config::TlsConfig {
+            ca_cert: if ca_cert.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(ca_cert))
+            },
+            client_cert: if client_cert.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(client_cert))
+            },
+            client_key: if client_key.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(client_key))
+            },
+            verify_mode: Some(verify_mode),
+        })
+    }
+
     /// Validate, persist, and register the connection. Handles both add and edit.
     pub fn save_new_connection(&mut self) -> anyhow::Result<()> {
         let name = self.add_connection_name.trim().to_string();
@@ -3062,13 +3208,14 @@ impl AppState {
         if let Err(reason) = validate_connection_url(&url) {
             anyhow::bail!("Bad URL: {reason}");
         }
+        let tls = self.build_tls_config(&url);
         let is_edit = self.edit_connection_original_name.is_some();
         if let Some(ref original) = self.edit_connection_original_name.clone() {
             // Editing: rename file if name changed, then overwrite
             if *original != name {
                 crate::config::delete_connection(original)?;
             }
-            crate::config::save_connection(&name, &url, password_opt)?;
+            crate::config::save_connection(&name, &url, password_opt, tls.as_ref())?;
             // Update in-memory entry. Store the URL as-is; the keyring
             // splice happens at load_connections() time on next startup.
             if let Some(entry) = self
@@ -3078,13 +3225,15 @@ impl AppState {
             {
                 entry.name = name.clone();
                 entry.url = url.clone();
+                entry.tls = tls.clone();
             }
         } else {
-            crate::config::save_connection(&name, &url, password_opt)?;
+            crate::config::save_connection(&name, &url, password_opt, tls.as_ref())?;
             self.available_connections
                 .push(crate::config::ConnectionConfig {
                     name: name.clone(),
                     url: url.clone(),
+                    tls: tls.clone(),
                 });
         }
         self.show_add_connection = false;
@@ -4954,10 +5103,12 @@ trailing prose ignored";
             crate::config::ConnectionConfig {
                 name: "alpha".into(),
                 url: "sqlite::memory:".into(),
+                tls: None,
             },
             crate::config::ConnectionConfig {
                 name: "beta".into(),
                 url: "sqlite::memory:".into(),
+                tls: None,
             },
         ];
         s.connection_switcher_cursor = 0;
@@ -4982,10 +5133,12 @@ trailing prose ignored";
             crate::config::ConnectionConfig {
                 name: "alpha".into(),
                 url: "sqlite::memory:".into(),
+                tls: None,
             },
             crate::config::ConnectionConfig {
                 name: "beta".into(),
                 url: "sqlite::memory:".into(),
+                tls: None,
             },
         ];
         s.delete_selected_connection().unwrap();
@@ -4993,5 +5146,156 @@ trailing prose ignored";
         s.switcher_down();
         assert!(s.connection_delete_armed.is_none());
         assert_eq!(s.available_connections.len(), 2);
+    }
+
+    /// Global lock + shared config tempdir for tests that exercise
+    /// `save_connection` / `load_connections`. The `CONFIG_DIR_OVERRIDE`
+    /// OnceLock in sqeel-config is first-call-wins per process, so all
+    /// tests that touch it must share one tempdir (kept alive in the static)
+    /// and serialise via this mutex.
+    static CONFIG_TEST_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    static CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the config-test mutex and return the shared tempdir path +
+    /// the guard so the caller holds the lock for the test's duration.
+    fn lock_config_dir() -> std::sync::MutexGuard<'static, ()> {
+        let guard = CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // First caller creates the dir and sets the OnceLock; subsequent
+        // callers reuse the same dir (it stays alive for the process lifetime).
+        CONFIG_TEST_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("config tempdir");
+            crate::config::set_config_dir_override(dir.path().to_path_buf());
+            dir
+        });
+        guard
+    }
+
+    /// Install the in-process mock keyring store so tests don't touch the real
+    /// OS keyring. Mirrors `sqeel_config::install_mock_keyring` which is only
+    /// available inside sqeel-config's own test compilation unit.
+    fn install_mock_keyring() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let store =
+                keyring_core::mock::Store::new().expect("mock keyring store creation failed");
+            keyring_core::set_default_store(store);
+        });
+    }
+
+    #[test]
+    fn tab_cycles_skip_tls_for_sqlite() {
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        s.add_connection_url = "sqlite::memory:".into();
+        s.add_connection_field = AddConnectionField::Name;
+        // Name → Url
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Url);
+        // Url → Password
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Password);
+        // Password → Name (no TLS fields for sqlite)
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Name);
+    }
+
+    #[test]
+    fn tab_cycles_include_tls_for_postgres() {
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        s.add_connection_url = "postgres://user@localhost/mydb".into();
+        s.add_connection_field = AddConnectionField::Name;
+        // Name → Url → Password → CaCert → ClientCert → ClientKey → VerifyMode → Name
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Url);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Password);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::CaCert);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::ClientCert);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::ClientKey);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::VerifyMode);
+        s.add_connection_tab();
+        assert_eq!(s.add_connection_field, AddConnectionField::Name);
+    }
+
+    #[test]
+    fn save_new_connection_persists_tls() {
+        install_mock_keyring();
+        let _guard = lock_config_dir();
+        // Clean up any leftovers from a previous run in this process.
+        let _ = crate::config::delete_connection("tls_pg");
+
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        s.add_connection_name = "tls_pg".into();
+        s.add_connection_url = "postgres://user@localhost/mydb".into();
+        s.add_connection_password = String::new();
+        s.add_connection_ca_cert = "/etc/ssl/ca.pem".into();
+        s.add_connection_ca_cert_cursor = 14;
+        s.add_connection_client_cert = "/etc/ssl/client.crt".into();
+        s.add_connection_client_cert_cursor = 19;
+        s.add_connection_client_key = "/etc/ssl/client.key".into();
+        s.add_connection_client_key_cursor = 19;
+        s.add_connection_verify_mode = sqeel_config::TlsVerifyMode::Skip;
+
+        s.save_new_connection().unwrap();
+
+        // Re-load from disk and assert TLS round-trips.
+        let conns = crate::config::load_connections().unwrap();
+        let conn = conns
+            .iter()
+            .find(|c| c.name == "tls_pg")
+            .expect("tls_pg not found");
+        let tls = conn.tls.as_ref().expect("tls must be Some");
+        assert_eq!(
+            tls.ca_cert,
+            Some(std::path::PathBuf::from("/etc/ssl/ca.pem"))
+        );
+        assert_eq!(
+            tls.client_cert,
+            Some(std::path::PathBuf::from("/etc/ssl/client.crt"))
+        );
+        assert_eq!(
+            tls.client_key,
+            Some(std::path::PathBuf::from("/etc/ssl/client.key"))
+        );
+        assert_eq!(tls.verify_mode, Some(sqeel_config::TlsVerifyMode::Skip));
+        // Cleanup for test isolation within this process.
+        let _ = crate::config::delete_connection("tls_pg");
+    }
+
+    #[test]
+    fn save_new_connection_omits_tls_for_sqlite() {
+        install_mock_keyring();
+        let _guard = lock_config_dir();
+        let _ = crate::config::delete_connection("no_tls_sqlite");
+
+        let state = AppState::new();
+        let mut s = state.lock().unwrap();
+        s.add_connection_name = "no_tls_sqlite".into();
+        s.add_connection_url = "sqlite::memory:".into();
+        s.add_connection_password = String::new();
+        // Even if TLS fields are populated, sqlite ignores them.
+        s.add_connection_ca_cert = "/etc/ssl/ca.pem".into();
+        s.add_connection_verify_mode = sqeel_config::TlsVerifyMode::Skip;
+
+        s.save_new_connection().unwrap();
+
+        let conns = crate::config::load_connections().unwrap();
+        let conn = conns
+            .iter()
+            .find(|c| c.name == "no_tls_sqlite")
+            .expect("no_tls_sqlite not found");
+        assert!(
+            conn.tls.is_none(),
+            "sqlite connection must have no tls block; got: {:?}",
+            conn.tls
+        );
+        let _ = crate::config::delete_connection("no_tls_sqlite");
     }
 }

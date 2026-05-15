@@ -1,9 +1,10 @@
 use crate::schema::SchemaNode;
 use crate::state::QueryResult;
+use sqeel_config::{TlsConfig, TlsVerifyMode};
 use sqlx::{
     Column, Row, TypeInfo,
-    mysql::MySqlPool,
-    postgres::PgPool,
+    mysql::{MySqlConnectOptions, MySqlPool, MySqlSslMode},
+    postgres::{PgConnectOptions, PgPool, PgSslMode},
     sqlite::{SqliteConnectOptions, SqlitePool},
 };
 use std::str::FromStr;
@@ -175,11 +176,47 @@ pub struct DbConnection {
 }
 
 impl DbConnection {
-    pub async fn connect(url: &str) -> Result<Self, ConnectError> {
+    pub async fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Self, ConnectError> {
         let pool = if url.starts_with("mysql://") || url.starts_with("mariadb://") {
-            Pool::MySql(MySqlPool::connect(url).await?)
+            let mut opts = MySqlConnectOptions::from_str(url)?;
+            if let Some(tls_cfg) = tls {
+                let ssl_mode = match tls_cfg.verify_mode {
+                    Some(TlsVerifyMode::Skip) => MySqlSslMode::Required,
+                    // Full or unspecified → full hostname + chain verification
+                    Some(TlsVerifyMode::Full) | None => MySqlSslMode::VerifyIdentity,
+                };
+                opts = opts.ssl_mode(ssl_mode);
+                if let Some(ca) = &tls_cfg.ca_cert {
+                    opts = opts.ssl_ca(ca);
+                }
+                if let Some(cert) = &tls_cfg.client_cert {
+                    opts = opts.ssl_client_cert(cert);
+                }
+                if let Some(key) = &tls_cfg.client_key {
+                    opts = opts.ssl_client_key(key);
+                }
+            }
+            Pool::MySql(MySqlPool::connect_with(opts).await?)
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            Pool::Pg(PgPool::connect(url).await?)
+            let mut opts = PgConnectOptions::from_str(url)?;
+            if let Some(tls_cfg) = tls {
+                let ssl_mode = match tls_cfg.verify_mode {
+                    Some(TlsVerifyMode::Skip) => PgSslMode::Require,
+                    // Full or unspecified → full hostname + chain verification
+                    Some(TlsVerifyMode::Full) | None => PgSslMode::VerifyFull,
+                };
+                opts = opts.ssl_mode(ssl_mode);
+                if let Some(ca) = &tls_cfg.ca_cert {
+                    opts = opts.ssl_root_cert(ca);
+                }
+                if let Some(cert) = &tls_cfg.client_cert {
+                    opts = opts.ssl_client_cert(cert);
+                }
+                if let Some(key) = &tls_cfg.client_key {
+                    opts = opts.ssl_client_key(key);
+                }
+            }
+            Pool::Pg(PgPool::connect_with(opts).await?)
         } else if url.starts_with("sqlite://") || url.starts_with("sqlite:") {
             // Match what every other SQL client does for sqlite: create
             // the DB file if it doesn't exist yet. Stops `--sandbox`
@@ -1206,14 +1243,18 @@ mod duckdb_tests {
 
     #[tokio::test]
     async fn duckdb_connect_in_memory() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         assert!(conn.is_duckdb());
         assert!(!conn.is_sqlite());
     }
 
     #[tokio::test]
     async fn duckdb_roundtrip_create_insert_select() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         let create = conn
             .execute("CREATE TABLE items (id INTEGER, name TEXT)")
             .await
@@ -1245,14 +1286,18 @@ mod duckdb_tests {
 
     #[tokio::test]
     async fn duckdb_list_databases() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         let dbs = conn.list_databases().await.unwrap();
         assert_eq!(dbs, vec!["main"]);
     }
 
     #[tokio::test]
     async fn duckdb_list_tables() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE alpha (x INTEGER)")
             .await
             .unwrap();
@@ -1264,7 +1309,9 @@ mod duckdb_tests {
 
     #[tokio::test]
     async fn duckdb_list_columns() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE people (id INTEGER, name TEXT, score DOUBLE)")
             .await
             .unwrap();
@@ -1278,7 +1325,9 @@ mod duckdb_tests {
         let dir = tempfile::tempdir().unwrap();
         let csv_path = dir.path().join("data.csv");
         std::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n").unwrap();
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         let q = format!("SELECT * FROM read_csv_auto('{}')", csv_path.display());
         let result = conn.execute(&q).await.unwrap();
         let ExecOutcome::Rows(qr) = result else {
@@ -1290,7 +1339,9 @@ mod duckdb_tests {
 
     #[tokio::test]
     async fn duckdb_null_renders_as_null_string() {
-        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let conn = DbConnection::connect("duckdb::memory:", None)
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE nulls (v TEXT)").await.unwrap();
         conn.execute("INSERT INTO nulls VALUES (NULL)")
             .await
@@ -1300,5 +1351,93 @@ mod duckdb_tests {
             panic!("expected rows")
         };
         assert_eq!(qr.rows[0][0], "NULL");
+    }
+
+    #[tokio::test]
+    async fn connect_duckdb_ignores_tls() {
+        use sqeel_config::{TlsConfig, TlsVerifyMode};
+        let tls = TlsConfig {
+            ca_cert: Some(std::path::PathBuf::from("/nonexistent/ca.pem")),
+            client_cert: None,
+            client_key: None,
+            verify_mode: Some(TlsVerifyMode::Full),
+        };
+        // DuckDB silently ignores TLS; connection must succeed.
+        let conn = DbConnection::connect("duckdb::memory:", Some(&tls))
+            .await
+            .unwrap();
+        assert!(conn.is_duckdb());
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use sqeel_config::{TlsConfig, TlsVerifyMode};
+
+    #[tokio::test]
+    async fn connect_mysql_with_tls_skip() {
+        let tls = TlsConfig {
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            verify_mode: Some(TlsVerifyMode::Skip),
+        };
+        // Bogus host — connection must fail (not panic) with TLS options applied.
+        let err = DbConnection::connect("mysql://user:pass@127.0.0.1:19999/db", Some(&tls))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        // Any connection-level error is acceptable; what matters is it didn't panic.
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            matches!(
+                err.kind,
+                ConnectErrorKind::Network | ConnectErrorKind::Tls | ConnectErrorKind::Other
+            ),
+            "unexpected error kind for mysql tls skip: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_postgres_with_tls_full_and_paths() {
+        let tls = TlsConfig {
+            ca_cert: Some(std::path::PathBuf::from("/nonexistent/ca.pem")),
+            client_cert: Some(std::path::PathBuf::from("/nonexistent/client.crt")),
+            client_key: Some(std::path::PathBuf::from("/nonexistent/client.key")),
+            verify_mode: Some(TlsVerifyMode::Full),
+        };
+        // Bogus CA path — sqlx must reject before even attempting TCP.
+        let err = DbConnection::connect("postgres://user:pass@127.0.0.1:19999/db", Some(&tls))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        // Accept Config (file-not-found at options build) or Network/Tls (connect-time).
+        assert!(
+            matches!(
+                err.kind,
+                ConnectErrorKind::Config
+                    | ConnectErrorKind::Tls
+                    | ConnectErrorKind::Network
+                    | ConnectErrorKind::Other
+            ),
+            "unexpected error kind for postgres tls full: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_sqlite_ignores_tls() {
+        let tls = TlsConfig {
+            ca_cert: Some(std::path::PathBuf::from("/nonexistent/ca.pem")),
+            client_cert: None,
+            client_key: None,
+            verify_mode: Some(TlsVerifyMode::Full),
+        };
+        // SQLite silently ignores TLS; in-memory connection must succeed.
+        let conn = DbConnection::connect("sqlite::memory:", Some(&tls))
+            .await
+            .unwrap();
+        assert!(conn.is_sqlite());
     }
 }

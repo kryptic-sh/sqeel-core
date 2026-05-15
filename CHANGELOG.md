@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-05-15
+
+### Added
+
+- **TLS support in `DbConnection::connect`** (issue #23 phase 1). Signature
+  changes from `connect(url: &str)` to
+  `connect(url: &str, tls: Option<&TlsConfig>)`. When `Some`, MySQL and Postgres
+  pools are built via `connect_with` on `MySqlConnectOptions` /
+  `PgConnectOptions` with `ssl_mode`, `ssl_ca` / `ssl_root_cert`,
+  `ssl_client_cert`, `ssl_client_key` mapped from the supplied
+  `sqeel_config::TlsConfig`. SQLite and DuckDB silently ignore `tls` (no network
+  TLS). `TlsVerifyMode::Full` maps to `VerifyIdentity` (MySQL) / `VerifyFull`
+  (Postgres); `Skip` maps to `Required` (MySQL) / `Require` (Postgres). Absent
+  (`None`) → driver defaults apply (same as before).
+- **TLS form-state machinery in `AppState`** (issue #23 phase 1, sqeel-tui
+  rendering follows). New `AddConnectionField` variants: `CaCert`, `ClientCert`,
+  `ClientKey`, `VerifyMode`. New `AppState` fields: `add_connection_ca_cert` /
+  `_cursor`, `add_connection_client_cert` / `_cursor`,
+  `add_connection_client_key` / `_cursor`, `add_connection_verify_mode`
+  (defaults to `Full`). Tab cycle includes the TLS fields only for
+  mysql/mariadb/postgres URLs (`url_supports_tls` helper).
+  `open_edit_connection` populates fields from the existing
+  `ConnectionConfig.tls`. `save_new_connection` builds a `TlsConfig` from the
+  form state (or `None` when all paths empty + `Full` mode) and threads it
+  through to `sqeel_config::save_connection`.
+
+### Changed
+
+- Bumped `sqeel-config` dep to `0.2` (resolves to 0.2.8 for the new
+  `save_connection(name, url, password, tls)` signature).
+
 ## [0.4.12] - 2026-05-15
 
 ### Fixed
@@ -308,7 +339,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.11...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.13...HEAD
+[0.4.13]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.13
+[0.4.12]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.12
+[0.4.11]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.11
 [0.4.11]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.11
 [0.4.10]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.10
 [0.4.9]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.9
