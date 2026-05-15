@@ -7,6 +7,8 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePool},
 };
 use std::str::FromStr;
+#[cfg(feature = "duckdb")]
+use std::sync::{Arc, Mutex};
 
 /// Outcome of `DbConnection::execute`. Row-returning queries (SELECT,
 /// SHOW, EXPLAIN, …) produce a `Rows` result; statements that don't
@@ -161,6 +163,8 @@ pub enum Pool {
     MySql(MySqlPool),
     Pg(PgPool),
     Sqlite(SqlitePool),
+    #[cfg(feature = "duckdb")]
+    DuckDb(Arc<Mutex<duckdb::Connection>>),
 }
 
 pub struct DbConnection {
@@ -183,6 +187,44 @@ impl DbConnection {
             // `?mode=ro` or `?mode=rw` in the URL to override.
             let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
             Pool::Sqlite(SqlitePool::connect_with(opts).await?)
+        } else if url.starts_with("duckdb:") {
+            #[cfg(feature = "duckdb")]
+            {
+                let url_owned = url.to_string();
+                let conn = tokio::task::spawn_blocking(
+                    move || -> Result<duckdb::Connection, ConnectError> {
+                        // `duckdb::memory:` → in-memory; `duckdb:/path` or `duckdb://path` → file.
+                        let rest = url_owned.strip_prefix("duckdb:").unwrap_or("");
+                        let path = rest.trim_start_matches('/');
+                        // `:memory:` is the duckdb-rs in-memory sentinel (after stripping `duckdb:`
+                        // from `duckdb::memory:` the rest is `:memory:`).
+                        if path == ":memory:" || path.is_empty() {
+                            duckdb::Connection::open_in_memory().map_err(|e| ConnectError {
+                                kind: ConnectErrorKind::Config,
+                                detail: e.to_string(),
+                            })
+                        } else {
+                            duckdb::Connection::open(path).map_err(|e| ConnectError {
+                                kind: ConnectErrorKind::Config,
+                                detail: e.to_string(),
+                            })
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| ConnectError {
+                    kind: ConnectErrorKind::Other,
+                    detail: e.to_string(),
+                })??;
+                Pool::DuckDb(Arc::new(Mutex::new(conn)))
+            }
+            #[cfg(not(feature = "duckdb"))]
+            {
+                return Err(ConnectError {
+                    kind: ConnectErrorKind::Config,
+                    detail: "DuckDB support not compiled in (enable the `duckdb` feature)".into(),
+                });
+            }
         } else {
             return Err(ConnectError {
                 kind: ConnectErrorKind::Config,
@@ -199,10 +241,21 @@ impl DbConnection {
         matches!(self.pool, Pool::Sqlite(_))
     }
 
+    pub fn is_duckdb(&self) -> bool {
+        #[cfg(feature = "duckdb")]
+        {
+            matches!(self.pool, Pool::DuckDb(_))
+        }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            false
+        }
+    }
+
     /// Load just the database/schema names as collapsed nodes with no tables.
     /// This is fast and lets the UI show the structure before tables are loaded.
     pub async fn load_schema_databases(&self) -> anyhow::Result<Vec<SchemaNode>> {
-        if self.is_sqlite() {
+        if self.is_sqlite() || self.is_duckdb() {
             return Ok(vec![SchemaNode::Database {
                 name: "main".into(),
                 expanded: true,
@@ -232,6 +285,19 @@ impl DbConnection {
                 Pool::MySql(p) => sqlx::query(query).execute(p).await?.rows_affected(),
                 Pool::Pg(p) => sqlx::query(query).execute(p).await?.rows_affected(),
                 Pool::Sqlite(p) => sqlx::query(query).execute(p).await?.rows_affected(),
+                #[cfg(feature = "duckdb")]
+                Pool::DuckDb(c) => {
+                    let conn = Arc::clone(c);
+                    let q = query.to_string();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+                        let conn = conn
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+                        let n = conn.execute(&q, [])?;
+                        Ok(n as u64)
+                    })
+                    .await??
+                }
             };
             return Ok(ExecOutcome::NonQuery {
                 verb,
@@ -288,6 +354,38 @@ impl DbConnection {
                     .collect();
                 (cols, data)
             }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(c) => {
+                let conn = Arc::clone(c);
+                let q = query.to_string();
+                tokio::task::spawn_blocking(
+                    move || -> anyhow::Result<(Vec<String>, Vec<Vec<String>>)> {
+                        let conn = conn
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+                        let mut stmt = conn.prepare(&q)?;
+                        // `query([])` executes the statement and returns Rows.
+                        // Column metadata is only available after execution, so we
+                        // read column names through `rows.as_ref()` rather than
+                        // calling `stmt.column_count()` before the query runs.
+                        let mut rows = stmt.query([])?;
+                        let cols: Vec<String> =
+                            rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
+                        let col_count = cols.len();
+                        let mut data: Vec<Vec<String>> = Vec::new();
+                        while let Some(row) = rows.next()? {
+                            let mut cells = Vec::with_capacity(col_count);
+                            for i in 0..col_count {
+                                let v: duckdb::types::Value = row.get(i)?;
+                                cells.push(duck_value_to_string(v));
+                            }
+                            data.push(cells);
+                        }
+                        Ok((cols, data))
+                    },
+                )
+                .await??
+            }
         };
 
         Ok(ExecOutcome::Rows(QueryResult {
@@ -320,6 +418,8 @@ impl DbConnection {
                     .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
                     .collect())
             }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(_) => Ok(vec!["main".into()]),
         }
     }
 
@@ -352,6 +452,23 @@ impl DbConnection {
                     .iter()
                     .map(|r| r.try_get::<String, _>(0).unwrap_or_default())
                     .collect())
+            }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(c) => {
+                let conn = Arc::clone(c);
+                let _db = database.to_string();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                    let conn = conn
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT table_name FROM information_schema.tables \
+                         WHERE table_schema = 'main' ORDER BY table_name",
+                    )?;
+                    let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    names.map(|r| r.map_err(Into::into)).collect()
+                })
+                .await?
             }
         }
     }
@@ -424,13 +541,39 @@ impl DbConnection {
                     })
                     .collect())
             }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(c) => {
+                let conn = Arc::clone(c);
+                let tbl = table.to_string();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ColumnInfo>> {
+                    let conn = conn
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("mutex poisoned: {e}"))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT column_name, data_type, is_nullable \
+                         FROM information_schema.columns \
+                         WHERE table_schema = 'main' AND table_name = ? \
+                         ORDER BY ordinal_position",
+                    )?;
+                    let infos = stmt.query_map([tbl.as_str()], |row| {
+                        Ok(ColumnInfo {
+                            name: row.get::<_, String>(0)?,
+                            type_name: row.get::<_, String>(1)?,
+                            nullable: row.get::<_, String>(2).map(|s| s == "YES").unwrap_or(true),
+                            is_pk: false,
+                        })
+                    })?;
+                    infos.map(|r| r.map_err(Into::into)).collect()
+                })
+                .await?
+            }
         }
     }
 
     /// Load the schema tree: databases + tables only (no columns — too slow to
     /// load eagerly for large schemas). Columns can be loaded on demand later.
     pub async fn load_schema(&self) -> anyhow::Result<Vec<SchemaNode>> {
-        if self.is_sqlite() {
+        if self.is_sqlite() || self.is_duckdb() {
             let tables = self.list_tables("main").await.unwrap_or_default();
             let table_nodes = tables
                 .into_iter()
@@ -804,6 +947,30 @@ fn decode_sqlite(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
     "?".into()
 }
 
+#[cfg(feature = "duckdb")]
+fn duck_value_to_string(v: duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    match v {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Text(s) => s,
+        Value::Blob(b) => b.iter().map(|byte| format!("{byte:02x}")).collect(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Rows added automatically when a SELECT/WITH query has no LIMIT clause.
 pub const DEFAULT_ROW_LIMIT: usize = 100;
 
@@ -1009,5 +1176,108 @@ mod limit_tests {
         let out = apply(q).unwrap();
         assert!(out.ends_with(" LIMIT 100"));
         assert!(out.contains("SELECT * FROM users"));
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn duckdb_connect_in_memory() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        assert!(conn.is_duckdb());
+        assert!(!conn.is_sqlite());
+    }
+
+    #[tokio::test]
+    async fn duckdb_roundtrip_create_insert_select() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let create = conn
+            .execute("CREATE TABLE items (id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        assert!(matches!(create, ExecOutcome::NonQuery { .. }));
+        let insert = conn
+            .execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            insert,
+            ExecOutcome::NonQuery {
+                rows_affected: 2,
+                ..
+            }
+        ));
+        let select = conn
+            .execute("SELECT id, name FROM items ORDER BY id")
+            .await
+            .unwrap();
+        let ExecOutcome::Rows(qr) = select else {
+            panic!("expected rows")
+        };
+        assert_eq!(qr.columns, vec!["id", "name"]);
+        assert_eq!(qr.rows.len(), 2);
+        assert_eq!(qr.rows[0], vec!["1", "alpha"]);
+        assert_eq!(qr.rows[1], vec!["2", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn duckdb_list_databases() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let dbs = conn.list_databases().await.unwrap();
+        assert_eq!(dbs, vec!["main"]);
+    }
+
+    #[tokio::test]
+    async fn duckdb_list_tables() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        conn.execute("CREATE TABLE alpha (x INTEGER)")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE beta (y TEXT)").await.unwrap();
+        let tables = conn.list_tables("main").await.unwrap();
+        assert!(tables.contains(&"alpha".to_string()), "tables: {tables:?}");
+        assert!(tables.contains(&"beta".to_string()), "tables: {tables:?}");
+    }
+
+    #[tokio::test]
+    async fn duckdb_list_columns() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        conn.execute("CREATE TABLE people (id INTEGER, name TEXT, score DOUBLE)")
+            .await
+            .unwrap();
+        let cols = conn.list_columns("main", "people").await.unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "score"]);
+    }
+
+    #[tokio::test]
+    async fn duckdb_csv_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("data.csv");
+        std::fs::write(&csv_path, "id,name\n1,alice\n2,bob\n").unwrap();
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        let q = format!("SELECT * FROM read_csv_auto('{}')", csv_path.display());
+        let result = conn.execute(&q).await.unwrap();
+        let ExecOutcome::Rows(qr) = result else {
+            panic!("expected rows")
+        };
+        assert_eq!(qr.columns, vec!["id", "name"]);
+        assert_eq!(qr.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duckdb_null_becomes_empty_string() {
+        let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
+        conn.execute("CREATE TABLE nulls (v TEXT)").await.unwrap();
+        conn.execute("INSERT INTO nulls VALUES (NULL)")
+            .await
+            .unwrap();
+        let result = conn.execute("SELECT v FROM nulls").await.unwrap();
+        let ExecOutcome::Rows(qr) = result else {
+            panic!("expected rows")
+        };
+        assert_eq!(qr.rows[0][0], "");
     }
 }

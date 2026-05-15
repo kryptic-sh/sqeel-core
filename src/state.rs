@@ -3634,7 +3634,14 @@ fn url_has_plaintext_password(url: &str) -> bool {
 /// the async sqlx handshake errors. Stays intentionally shallow —
 /// authoritative validation is sqlx's own connect call.
 fn validate_connection_url(url: &str) -> Result<(), String> {
-    const SCHEMES: &[&str] = &["mysql", "mariadb", "postgres", "postgresql", "sqlite"];
+    const SCHEMES: &[&str] = &[
+        "mysql",
+        "mariadb",
+        "postgres",
+        "postgresql",
+        "sqlite",
+        "duckdb",
+    ];
     let Some((scheme, rest)) = url.split_once(':') else {
         return Err("missing scheme (try `mysql://user@host/db`)".into());
     };
@@ -3644,9 +3651,10 @@ fn validate_connection_url(url: &str) -> Result<(), String> {
             SCHEMES.join(", ")
         ));
     }
-    // Network drivers want `scheme://...`; sqlite also accepts the
-    // `sqlite::memory:` form so it skips the `//` requirement.
-    if scheme != "sqlite" && !rest.starts_with("//") {
+    // Network drivers want `scheme://...`; sqlite and duckdb also accept
+    // single-colon forms (`sqlite::memory:`, `duckdb::memory:`, `duckdb:/path`)
+    // so they skip the `//` requirement.
+    if scheme != "sqlite" && scheme != "duckdb" && !rest.starts_with("//") {
         return Err(format!("expected `{scheme}://...`"));
     }
     let body = rest.trim_start_matches("//");
@@ -4874,6 +4882,8 @@ trailing prose ignored";
         assert!(validate_connection_url("postgresql://localhost/db").is_ok());
         assert!(validate_connection_url("sqlite:///path/to/file.db").is_ok());
         assert!(validate_connection_url("sqlite::memory:").is_ok());
+        assert!(validate_connection_url("duckdb::memory:").is_ok());
+        assert!(validate_connection_url("duckdb:/tmp/foo.duckdb").is_ok());
     }
 
     #[test]

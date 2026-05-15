@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-05-15
+
+### Added
+
+- **DuckDB backend** (`duckdb` feature, default-on). `Pool` gains a
+  `DuckDb(Arc<Mutex<duckdb::Connection>>)` variant backed by `duckdb = "1"` with
+  the `bundled` feature so no system library is required. URL schemes:
+  `duckdb::memory:` (in-memory) and `duckdb:/path/to/file.duckdb` (file). Schema
+  introspection uses `information_schema.tables` / `.columns`. CSV and Parquet
+  files are readable out of the box via DuckDB's auto-loaders
+  (`SELECT * FROM read_csv_auto('file.csv')`). Disabling the feature compiles
+  cleanly and returns `ConnectErrorKind::Config` for `duckdb:` URLs.
+  `is_duckdb()` added alongside the existing `is_sqlite()`.
+  (kryptic-sh/sqeel#27)
+- `validate_connection_url` in `state.rs` now accepts `duckdb:` URLs
+  (`duckdb::memory:` and `duckdb:/path` forms, no `//` required).
+
 ## [0.4.10] - 2026-05-15
 
 ### Added
@@ -281,7 +298,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Standalone `LICENSE`, `.gitignore`, `deny.toml`, `rust-toolchain.toml`, and CI
   workflows at the repo root.
 
-[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.10...HEAD
+[Unreleased]: https://github.com/kryptic-sh/sqeel-core/compare/v0.4.11...HEAD
+[0.4.11]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.11
 [0.4.10]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.10
 [0.4.9]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.9
 [0.4.8]: https://github.com/kryptic-sh/sqeel-core/releases/tag/v0.4.8
