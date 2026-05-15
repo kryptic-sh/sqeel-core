@@ -506,11 +506,16 @@ impl Highlighter {
         let mut inner_spans = inner.highlight_range(bytes, byte_range.clone());
         hjkl_bonsai::CommentMarkerPass::new().apply(&mut inner_spans, bytes);
 
+        // Build newline offsets once and reuse across all per-span row/col
+        // lookups (O(N) build + O(log N) per lookup vs O(N) per lookup).
+        let nl_offsets = compute_newline_offsets(source);
+
         let mut spans: Vec<HighlightSpan> = inner_spans
             .into_iter()
             .map(|s| {
-                let (start_row, start_col) = byte_to_rowcol(source, s.byte_range.start);
-                let (end_row, end_col) = byte_to_rowcol(source, s.byte_range.end);
+                let (start_row, start_col) =
+                    byte_to_rowcol_with_offsets(&nl_offsets, s.byte_range.start);
+                let (end_row, end_col) = byte_to_rowcol_with_offsets(&nl_offsets, s.byte_range.end);
                 HighlightSpan {
                     start_byte: s.byte_range.start,
                     end_byte: s.byte_range.end,
@@ -541,8 +546,8 @@ impl Highlighter {
                 {
                     return None;
                 }
-                let (start_row, start_col) = byte_to_rowcol(source, start_byte);
-                let (end_row, end_col) = byte_to_rowcol(source, end_byte);
+                let (start_row, start_col) = byte_to_rowcol_with_offsets(&nl_offsets, start_byte);
+                let (end_row, end_col) = byte_to_rowcol_with_offsets(&nl_offsets, end_byte);
                 Some(ParseError {
                     start_byte,
                     end_byte,
@@ -579,6 +584,7 @@ impl Highlighter {
             None => return vec![],
         };
         let bytes = source.as_bytes();
+        let nl_offsets = compute_newline_offsets(source);
         let inner_errors = inner.parse_errors_range(bytes, 0..bytes.len());
         inner_errors
             .into_iter()
@@ -590,8 +596,8 @@ impl Highlighter {
                 {
                     return None;
                 }
-                let (start_row, start_col) = byte_to_rowcol(source, start_byte);
-                let (end_row, end_col) = byte_to_rowcol(source, end_byte);
+                let (start_row, start_col) = byte_to_rowcol_with_offsets(&nl_offsets, start_byte);
+                let (end_row, end_col) = byte_to_rowcol_with_offsets(&nl_offsets, end_byte);
                 Some(ParseError {
                     start_byte,
                     end_byte,
@@ -659,6 +665,9 @@ impl Highlighter {
         // produce.
         inner.reset();
 
+        // Build newline offsets once and reuse across all per-span lookups.
+        let nl_offsets = compute_newline_offsets(source.as_str());
+
         // Get inner spans (capture-name tagged, byte-range only).
         let mut inner_spans: Vec<InnerSpan> = inner.highlight(bytes);
         hjkl_bonsai::CommentMarkerPass::new().apply(&mut inner_spans, bytes);
@@ -667,8 +676,9 @@ impl Highlighter {
         let mut spans: Vec<HighlightSpan> = inner_spans
             .into_iter()
             .map(|s| {
-                let (start_row, start_col) = byte_to_rowcol(source.as_str(), s.byte_range.start);
-                let (end_row, end_col) = byte_to_rowcol(source.as_str(), s.byte_range.end);
+                let (start_row, start_col) =
+                    byte_to_rowcol_with_offsets(&nl_offsets, s.byte_range.start);
+                let (end_row, end_col) = byte_to_rowcol_with_offsets(&nl_offsets, s.byte_range.end);
                 HighlightSpan {
                     start_byte: s.byte_range.start,
                     end_byte: s.byte_range.end,
@@ -697,8 +707,8 @@ impl Highlighter {
                 {
                     return None;
                 }
-                let (start_row, start_col) = byte_to_rowcol(source.as_str(), start_byte);
-                let (end_row, end_col) = byte_to_rowcol(source.as_str(), end_byte);
+                let (start_row, start_col) = byte_to_rowcol_with_offsets(&nl_offsets, start_byte);
+                let (end_row, end_col) = byte_to_rowcol_with_offsets(&nl_offsets, end_byte);
                 Some(ParseError {
                     start_byte,
                     end_byte,
@@ -750,11 +760,38 @@ fn collect_block_ranges(node: tree_sitter::Node, out: &mut Vec<(usize, usize)>) 
     }
 }
 
-fn byte_to_rowcol(source: &str, byte: usize) -> (usize, usize) {
-    let prefix = &source[..byte.min(source.len())];
-    let row = prefix.bytes().filter(|&b| b == b'\n').count();
-    let col = prefix.bytes().rev().take_while(|&b| b != b'\n').count();
+/// Collect the byte offset of every `\n` in `source`, sorted ascending.
+/// Build this once per highlight call and pass the slice to
+/// [`byte_to_rowcol_with_offsets`] to get O(log N) per lookup instead of O(N).
+fn compute_newline_offsets(source: &str) -> Vec<usize> {
+    source
+        .bytes()
+        .enumerate()
+        .filter_map(|(i, b)| if b == b'\n' { Some(i) } else { None })
+        .collect()
+}
+
+/// O(log N) row/col lookup using a pre-built sorted list of newline offsets.
+/// `newline_offsets` must be the slice returned by [`compute_newline_offsets`]
+/// for the same `source`.
+fn byte_to_rowcol_with_offsets(newline_offsets: &[usize], byte: usize) -> (usize, usize) {
+    // Number of newlines before `byte` == the row index.
+    let row = newline_offsets.partition_point(|&nl| nl < byte);
+    // Column = distance from the last newline (or start of source) to `byte`.
+    let col = match row.checked_sub(1).and_then(|i| newline_offsets.get(i)) {
+        Some(&last_nl) => byte.saturating_sub(last_nl + 1),
+        None => byte,
+    };
     (row, col)
+}
+
+/// Thin wrapper that builds newline offsets on the fly. Callers that invoke
+/// this in a loop should use [`byte_to_rowcol_with_offsets`] directly with a
+/// single pre-built offset table.
+#[allow(dead_code)]
+fn byte_to_rowcol(source: &str, byte: usize) -> (usize, usize) {
+    let offsets = compute_newline_offsets(source);
+    byte_to_rowcol_with_offsets(&offsets, byte.min(source.len()))
 }
 
 /// Range-scoped variant of [`promote_uncovered_dialect_keywords`]: only
@@ -794,6 +831,7 @@ fn promote_uncovered_dialect_keywords_in_range(
     }
 
     let bytes = source.as_bytes();
+    let nl_offsets = compute_newline_offsets(source);
     let mut cursor = range_start;
     let mut gap_iter = merged.iter().peekable();
     let mut additions: Vec<HighlightSpan> = Vec::new();
@@ -805,11 +843,27 @@ fn promote_uncovered_dialect_keywords_in_range(
             }
             Some(&(gs, _)) => {
                 let stop = gs.min(range_end);
-                scan_gap_for_keywords(source, bytes, cursor, stop, dialect, &mut additions);
+                scan_gap_for_keywords(
+                    source,
+                    bytes,
+                    cursor,
+                    stop,
+                    dialect,
+                    &nl_offsets,
+                    &mut additions,
+                );
                 cursor = stop;
             }
             None => {
-                scan_gap_for_keywords(source, bytes, cursor, range_end, dialect, &mut additions);
+                scan_gap_for_keywords(
+                    source,
+                    bytes,
+                    cursor,
+                    range_end,
+                    dialect,
+                    &nl_offsets,
+                    &mut additions,
+                );
                 cursor = range_end;
             }
         }
@@ -852,6 +906,7 @@ fn promote_uncovered_dialect_keywords(
     }
 
     let bytes = source.as_bytes();
+    let nl_offsets = compute_newline_offsets(source);
     let mut cursor = 0usize;
     let mut gap_iter = merged.iter().peekable();
     let mut additions: Vec<HighlightSpan> = Vec::new();
@@ -862,11 +917,27 @@ fn promote_uncovered_dialect_keywords(
                 gap_iter.next();
             }
             Some(&(gs, _)) => {
-                scan_gap_for_keywords(source, bytes, cursor, gs, dialect, &mut additions);
+                scan_gap_for_keywords(
+                    source,
+                    bytes,
+                    cursor,
+                    gs,
+                    dialect,
+                    &nl_offsets,
+                    &mut additions,
+                );
                 cursor = gs;
             }
             None => {
-                scan_gap_for_keywords(source, bytes, cursor, total, dialect, &mut additions);
+                scan_gap_for_keywords(
+                    source,
+                    bytes,
+                    cursor,
+                    total,
+                    dialect,
+                    &nl_offsets,
+                    &mut additions,
+                );
                 cursor = total;
             }
         }
@@ -881,6 +952,7 @@ fn scan_gap_for_keywords(
     start: usize,
     end: usize,
     dialect: Dialect,
+    nl_offsets: &[usize],
     out: &mut Vec<HighlightSpan>,
 ) {
     let mut i = start;
@@ -900,8 +972,8 @@ fn scan_gap_for_keywords(
         }
         let word = &source[word_start..i];
         if dialect.is_extra_keyword(word) {
-            let (start_row, start_col) = byte_to_rowcol(source, word_start);
-            let (end_row, end_col) = byte_to_rowcol(source, i);
+            let (start_row, start_col) = byte_to_rowcol_with_offsets(nl_offsets, word_start);
+            let (end_row, end_col) = byte_to_rowcol_with_offsets(nl_offsets, i);
             out.push(HighlightSpan {
                 start_byte: word_start,
                 end_byte: i,
