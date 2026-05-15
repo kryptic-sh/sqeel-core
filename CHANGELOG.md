@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-05-15
+
+### Fixed
+
+- **Windows linker error with DuckDB feature.** Added `build.rs` that emits
+  `cargo:rustc-link-lib=rstrtmgr` on Windows when the `duckdb` feature is
+  enabled. DuckDB's bundled build references `RmStartSession` / `RmEndSession` /
+  `RmRegisterResources` / `RmGetList` (Windows Restart Manager) but
+  `libduckdb-sys` does not add `rstrtmgr.lib` to the link set automatically.
+
 ## [0.4.11] - 2026-05-15
 
 ### Added
