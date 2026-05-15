@@ -599,6 +599,13 @@ pub struct AppState {
     /// Top item index currently shown in the schema list. Decoupled from the
     /// cursor so the mouse wheel can scroll without dragging the selection.
     pub schema_scroll_offset: usize,
+    /// Credentials loaded from `~/.pgpass` (or `$PGPASSFILE`) at startup.
+    /// Empty when no file exists or the file has insecure permissions.
+    pub pgpass_entries: Vec<sqeel_config::PgpassEntry>,
+    /// Whether the pgpass credential picker dialog is open.
+    pub show_pgpass_picker: bool,
+    /// Selected row in the pgpass picker.
+    pub pgpass_picker_cursor: usize,
 }
 
 impl AppState {
@@ -2935,6 +2942,73 @@ impl AppState {
         self.disarm_connection_delete();
     }
 
+    pub fn open_pgpass_picker(&mut self) {
+        self.show_pgpass_picker = true;
+        self.pgpass_picker_cursor = 0;
+    }
+
+    pub fn close_pgpass_picker(&mut self) {
+        self.show_pgpass_picker = false;
+    }
+
+    pub fn pgpass_picker_down(&mut self) {
+        let max = self.pgpass_entries.len().saturating_sub(1);
+        self.pgpass_picker_cursor = (self.pgpass_picker_cursor + 1).min(max);
+    }
+
+    pub fn pgpass_picker_up(&mut self) {
+        self.pgpass_picker_cursor = self.pgpass_picker_cursor.saturating_sub(1);
+    }
+
+    /// Apply the currently-selected pgpass entry to the add-connection form.
+    ///
+    /// The add-connection form is opened (cleared) first, then the fields are
+    /// populated from the pgpass entry. Wildcards (`*`) are mapped to sensible
+    /// defaults: `*` host → empty, `*` port → `5432`, `*` database → empty,
+    /// `*` user → empty. The password is taken verbatim (wildcards here are
+    /// kept as-is — a literal `*` password is unusual but the user can correct
+    /// it). Closes the pgpass picker and opens the add-connection form.
+    pub fn pgpass_apply_selected(&mut self) {
+        let Some(entry) = self.pgpass_entries.get(self.pgpass_picker_cursor).cloned() else {
+            return;
+        };
+        self.close_pgpass_picker();
+        self.open_add_connection();
+
+        let host = if entry.host == "*" {
+            String::new()
+        } else {
+            entry.host.clone()
+        };
+        let port = if entry.port == "*" {
+            "5432".to_string()
+        } else {
+            entry.port.clone()
+        };
+        let database = if entry.database == "*" {
+            String::new()
+        } else {
+            entry.database.clone()
+        };
+        let user = if entry.user == "*" {
+            String::new()
+        } else {
+            entry.user.clone()
+        };
+
+        // Build the URL using the `url` crate so user/db components that
+        // contain special characters are percent-encoded correctly.
+        let url = build_pgpass_url(&host, &port, &database, &user);
+        let auto_name = build_pgpass_auto_name(&database, &host);
+
+        self.add_connection_url = url;
+        self.add_connection_url_cursor = self.add_connection_url.chars().count();
+        self.add_connection_name = auto_name;
+        self.add_connection_name_cursor = self.add_connection_name.chars().count();
+        self.add_connection_password = entry.password.clone();
+        self.add_connection_password_cursor = self.add_connection_password.chars().count();
+    }
+
     pub fn open_edit_connection(&mut self) {
         let Some(conn) = self
             .available_connections
@@ -3824,6 +3898,40 @@ fn validate_connection_url(url: &str) -> Result<(), String> {
         return Err("URL has no host or path".into());
     }
     Ok(())
+}
+
+/// Build a `postgres://user@host:port/database` URL from pgpass fields.
+///
+/// Uses the `url` crate so user and database components that contain
+/// special characters are percent-encoded correctly. Empty host, user,
+/// or database produce a partial URL the user can complete in the form.
+fn build_pgpass_url(host: &str, port: &str, database: &str, user: &str) -> String {
+    let host_part = if host.is_empty() { "localhost" } else { host };
+    let port_num: u16 = port.parse().unwrap_or(5432);
+
+    // Build via the url crate so set_username and set_path handle
+    // percent-encoding of special characters in those components.
+    let base = format!("postgres://{host_part}:{port_num}/");
+    let Ok(mut parsed) = url::Url::parse(&base) else {
+        return "postgres://".to_string();
+    };
+    if !user.is_empty() {
+        let _ = parsed.set_username(user);
+    }
+    if !database.is_empty() {
+        let db_path = format!("/{database}");
+        parsed.set_path(&db_path);
+    }
+    parsed.to_string()
+}
+
+/// Auto-generate a human-readable connection name from database + host.
+///
+/// Examples: `mydb @ prod.example.com`, `* @ localhost`.
+fn build_pgpass_auto_name(database: &str, host: &str) -> String {
+    let db = if database.is_empty() { "*" } else { database };
+    let h = if host.is_empty() { "localhost" } else { host };
+    format!("{db} @ {h}")
 }
 
 #[cfg(test)]
