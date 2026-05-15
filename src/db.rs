@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 /// produce a result set (INSERT/UPDATE/DELETE, CREATE/DROP/ALTER, …)
 /// produce a `NonQuery` summary the UI can render as a status line
 /// instead of an empty table.
+#[non_exhaustive]
 pub enum ExecOutcome {
     Rows(QueryResult),
     NonQuery { verb: String, rows_affected: u64 },
@@ -24,6 +25,7 @@ pub enum ExecOutcome {
 /// sidebar render a short headline ("Auth failed" vs "Host not
 /// found") and the details popup show the underlying message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectErrorKind {
     /// Could reach the network but auth was rejected (bad password,
     /// access denied, role doesn't exist).
@@ -426,7 +428,8 @@ impl DbConnection {
     pub async fn list_tables(&self, database: &str) -> anyhow::Result<Vec<String>> {
         match &self.pool {
             Pool::MySql(p) => {
-                let rows = sqlx::query(&format!("SHOW TABLES FROM `{database}`"))
+                let safe_db = database.replace('`', "``");
+                let rows = sqlx::query(&format!("SHOW TABLES FROM `{safe_db}`"))
                     .fetch_all(p)
                     .await?;
                 Ok(rows.iter().map(|r| mysql_string(r, 0)).collect())
@@ -501,7 +504,8 @@ impl DbConnection {
                     .collect())
             }
             Pool::Sqlite(p) => {
-                let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+                let safe_table = table.replace('"', "\"\"");
+                let rows = sqlx::query(&format!("PRAGMA table_info(\"{safe_table}\")"))
                     .fetch_all(p)
                     .await?;
                 Ok(rows
@@ -951,7 +955,7 @@ fn decode_sqlite(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
 fn duck_value_to_string(v: duckdb::types::Value) -> String {
     use duckdb::types::Value;
     match v {
-        Value::Null => String::new(),
+        Value::Null => "NULL".to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::TinyInt(n) => n.to_string(),
         Value::SmallInt(n) => n.to_string(),
@@ -1015,7 +1019,10 @@ pub fn apply_default_limit(query: &str, limit: usize) -> Option<String> {
     if first_kw != "SELECT" && first_kw != "WITH" {
         return None;
     }
-    if has_top_level_keyword(trimmed, "LIMIT") {
+    if has_top_level_keyword(trimmed, "LIMIT")
+        || has_top_level_keyword(trimmed, "FETCH")
+        || has_top_level_keyword(trimmed, "TOP")
+    {
         return None;
     }
     Some(format!("{trimmed} LIMIT {limit}"))
@@ -1177,6 +1184,20 @@ mod limit_tests {
         assert!(out.ends_with(" LIMIT 100"));
         assert!(out.contains("SELECT * FROM users"));
     }
+
+    #[test]
+    fn leaves_query_with_fetch_first() {
+        // FETCH FIRST N ROWS ONLY is SQL standard pagination — don't double-limit
+        assert_eq!(apply("SELECT * FROM t FETCH FIRST 10 ROWS ONLY"), None);
+        assert_eq!(apply("SELECT * FROM t FETCH NEXT 5 ROWS ONLY"), None);
+    }
+
+    #[test]
+    fn leaves_query_with_top() {
+        // TOP N is SQL Server/T-SQL pagination — don't double-limit
+        assert_eq!(apply("SELECT TOP 10 * FROM t"), None);
+        assert_eq!(apply("select top 100 id from users"), None);
+    }
 }
 
 #[cfg(all(test, feature = "duckdb"))]
@@ -1268,7 +1289,7 @@ mod duckdb_tests {
     }
 
     #[tokio::test]
-    async fn duckdb_null_becomes_empty_string() {
+    async fn duckdb_null_renders_as_null_string() {
         let conn = DbConnection::connect("duckdb::memory:").await.unwrap();
         conn.execute("CREATE TABLE nulls (v TEXT)").await.unwrap();
         conn.execute("INSERT INTO nulls VALUES (NULL)")
@@ -1278,6 +1299,6 @@ mod duckdb_tests {
         let ExecOutcome::Rows(qr) = result else {
             panic!("expected rows")
         };
-        assert_eq!(qr.rows[0][0], "");
+        assert_eq!(qr.rows[0][0], "NULL");
     }
 }
