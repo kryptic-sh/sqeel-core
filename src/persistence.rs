@@ -74,7 +74,7 @@ pub fn next_scratch_name() -> anyhow::Result<String> {
             return Ok(name);
         }
     }
-    Ok("scratch_overflow.sql".into())
+    anyhow::bail!("scratch buffer limit reached (999 files); please save or delete some")
 }
 
 /// Save a SQL buffer to the queries dir.
