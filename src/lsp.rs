@@ -83,6 +83,7 @@ pub enum LspEvent {
     Completion(i64, Vec<String>),
     Hover(i64, String),
     Definition(i64, String, u32, u32),
+    SignatureHelp(i64, String),
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
@@ -210,6 +211,20 @@ impl LspWriter {
         }));
         id
     }
+
+    pub fn request_signature_help(&self, uri: Uri, line: u32, col: u32) -> i64 {
+        let id = next_id();
+        self.inner.manager.send_request(
+            id,
+            BUF,
+            "textDocument/signatureHelp",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": line, "character": col }
+            }),
+        );
+        id
+    }
 }
 
 // ── Bridge ────────────────────────────────────────────────────────────────────
@@ -292,6 +307,11 @@ fn translate_response(id: i64, result: Value) -> Option<LspEvent> {
         }
         return hover_text_from_contents(&hover.contents).map(|t| LspEvent::Hover(id, t));
     }
+    if let Ok(sig) = serde_json::from_value::<SignatureHelp>(result.clone())
+        && let Some(text) = signature_help_text(&sig)
+    {
+        return Some(LspEvent::SignatureHelp(id, text));
+    }
     if let Ok(list) = serde_json::from_value::<CompletionResponse>(result) {
         let items: Vec<String> = match list {
             CompletionResponse::Array(v) => v.into_iter().map(|i| i.label).collect(),
@@ -310,6 +330,56 @@ fn translate_response(id: i64, result: Value) -> Option<LspEvent> {
         }
     }
     None
+}
+
+fn signature_help_text(sig: &SignatureHelp) -> Option<String> {
+    if sig.signatures.is_empty() {
+        return None;
+    }
+    let idx = sig.active_signature.unwrap_or(0) as usize;
+    let info = sig.signatures.get(idx).or_else(|| sig.signatures.first())?;
+    let label = &info.label;
+    if label.trim().is_empty() {
+        return None;
+    }
+    // Resolve active parameter index: per-signature wins over top-level.
+    let active_param = info
+        .active_parameter
+        .or(sig.active_parameter)
+        .map(|n| n as usize);
+    let text = if let Some(param_idx) = active_param
+        && let Some(ref params) = info.parameters
+        && let Some(param) = params.get(param_idx)
+    {
+        match &param.label {
+            ParameterLabel::Simple(name) => {
+                // Wrap the first occurrence of the param substring in `[…]`.
+                if let Some(pos) = label.find(name.as_str()) {
+                    let before = &label[..pos];
+                    let after = &label[pos + name.len()..];
+                    format!("{before}[{name}]{after}")
+                } else {
+                    label.clone()
+                }
+            }
+            ParameterLabel::LabelOffsets([start, end]) => {
+                let s = *start as usize;
+                let e = *end as usize;
+                // Offsets are byte-safe via char boundary checks.
+                if s <= label.len() && e <= label.len() && s <= e {
+                    let param_slice = &label[s..e];
+                    let before = &label[..s];
+                    let after = &label[e..];
+                    format!("{before}[{param_slice}]{after}")
+                } else {
+                    label.clone()
+                }
+            }
+        }
+    } else {
+        label.clone()
+    };
+    Some(text)
 }
 
 fn hover_text_from_contents(contents: &HoverContents) -> Option<String> {
@@ -440,5 +510,123 @@ mod tests {
     fn hover_text_empty_returns_none() {
         let contents = HoverContents::Scalar(MarkedString::String("   ".into()));
         assert_eq!(super::hover_text_from_contents(&contents), None);
+    }
+
+    fn make_sig(
+        label: &str,
+        params: Vec<ParameterLabel>,
+        active_sig: Option<u32>,
+        active_param: Option<u32>,
+    ) -> SignatureHelp {
+        SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: label.to_string(),
+                documentation: None,
+                parameters: Some(
+                    params
+                        .into_iter()
+                        .map(|l| ParameterInformation {
+                            label: l,
+                            documentation: None,
+                        })
+                        .collect(),
+                ),
+                active_parameter: None,
+            }],
+            active_signature: active_sig,
+            active_parameter: active_param,
+        }
+    }
+
+    #[test]
+    fn sig_help_label_extracted() {
+        let sig = make_sig(
+            "date_trunc(field text, source timestamp)",
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            super::signature_help_text(&sig),
+            Some("date_trunc(field text, source timestamp)".into())
+        );
+    }
+
+    #[test]
+    fn sig_help_active_param_simple_wrapped() {
+        let sig = make_sig(
+            "date_trunc(field text, source timestamp)",
+            vec![
+                ParameterLabel::Simple("field text".into()),
+                ParameterLabel::Simple("source timestamp".into()),
+            ],
+            None,
+            Some(0),
+        );
+        assert_eq!(
+            super::signature_help_text(&sig),
+            Some("date_trunc([field text], source timestamp)".into())
+        );
+    }
+
+    #[test]
+    fn sig_help_active_param_second_simple() {
+        let sig = make_sig(
+            "date_trunc(field text, source timestamp)",
+            vec![
+                ParameterLabel::Simple("field text".into()),
+                ParameterLabel::Simple("source timestamp".into()),
+            ],
+            None,
+            Some(1),
+        );
+        assert_eq!(
+            super::signature_help_text(&sig),
+            Some("date_trunc(field text, [source timestamp])".into())
+        );
+    }
+
+    #[test]
+    fn sig_help_active_param_offsets() {
+        let label = "fn(a int, b text)";
+        // "a int" is at bytes 3..8, "b text" at bytes 10..16
+        let sig = make_sig(
+            label,
+            vec![
+                ParameterLabel::LabelOffsets([3, 8]),
+                ParameterLabel::LabelOffsets([10, 16]),
+            ],
+            None,
+            Some(1),
+        );
+        assert_eq!(
+            super::signature_help_text(&sig),
+            Some("fn(a int, [b text])".into())
+        );
+    }
+
+    #[test]
+    fn sig_help_empty_signatures_returns_none() {
+        let sig = SignatureHelp {
+            signatures: vec![],
+            active_signature: None,
+            active_parameter: None,
+        };
+        assert_eq!(super::signature_help_text(&sig), None);
+    }
+
+    #[test]
+    fn sig_help_empty_label_returns_none() {
+        let sig = SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: "   ".to_string(),
+                documentation: None,
+                parameters: None,
+                active_parameter: None,
+            }],
+            active_signature: None,
+            active_parameter: None,
+        };
+        assert_eq!(super::signature_help_text(&sig), None);
     }
 }
