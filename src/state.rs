@@ -204,13 +204,14 @@ impl QueryResult {
                     .map(|row| row.get(i).map(|s| s.len()).unwrap_or(0))
                     .max()
                     .unwrap_or(0);
-                (col.len().max(max_data) + 2) as u16
+                (col.len().max(max_data) + 2).min(u16::MAX as usize) as u16
             })
             .collect();
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResultsPane {
     #[default]
     Empty,
@@ -534,7 +535,8 @@ pub struct AppState {
     /// Lazy schema-load channel — set by the binary when connected. Toggling a
     /// sidebar node into an expanded state posts a request here so the loader
     /// fetches tables/columns on demand instead of eagerly up front.
-    pub schema_load_tx: Option<tokio::sync::mpsc::UnboundedSender<SchemaLoadRequest>>,
+    /// Bounded (capacity 64) to prevent OOM from burst expansions.
+    pub schema_load_tx: Option<tokio::sync::mpsc::Sender<SchemaLoadRequest>>,
     /// In-flight lazy schema loads. Bumped on send, decremented by the loader
     /// when each request finishes. Drives the sidebar spinner.
     pub schema_pending_loads: usize,
@@ -2414,12 +2416,18 @@ impl AppState {
         if self.schema_loads_inflight.contains(&req) {
             return;
         }
-        if let Some(tx) = &self.schema_load_tx
-            && tx.send(req.clone()).is_ok()
-        {
-            self.schema_loads_inflight.insert(req);
-            self.schema_pending_loads += 1;
-            self.schema_loading = true;
+        if let Some(tx) = &self.schema_load_tx {
+            match tx.try_send(req.clone()) {
+                Ok(()) => {
+                    self.schema_loads_inflight.insert(req);
+                    self.schema_pending_loads += 1;
+                    self.schema_loading = true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("schema load channel full; dropping request {:?}", req);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
     }
 
@@ -3368,11 +3376,16 @@ impl AppState {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.content = Some((*self.editor_content).clone());
         }
-        if let Ok(name) = persistence::next_scratch_name() {
-            let _ = persistence::save_query(&name, &content);
-            self.tabs.push(TabEntry::open(name, content.clone()));
-            self.active_tab = self.tabs.len() - 1;
-            self.tab_content_pending = Some(content);
+        match persistence::next_scratch_name() {
+            Ok(name) => {
+                let _ = persistence::save_query(&name, &content);
+                self.tabs.push(TabEntry::open(name, content.clone()));
+                self.active_tab = self.tabs.len() - 1;
+                self.tab_content_pending = Some(content);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot create new scratch tab");
+            }
         }
     }
 
@@ -4246,7 +4259,7 @@ trailing prose ignored";
 
     #[test]
     fn lazy_load_fires_tables_for_unloaded_database() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.set_schema_nodes(sample_schema());
@@ -4268,7 +4281,7 @@ trailing prose ignored";
 
     #[test]
     fn lazy_load_skips_loaded_database() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.set_schema_nodes(sample_schema());
@@ -4284,7 +4297,7 @@ trailing prose ignored";
 
     #[test]
     fn lazy_load_fires_columns_for_unloaded_table() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.set_schema_nodes(sample_schema());
@@ -4307,7 +4320,7 @@ trailing prose ignored";
 
     #[test]
     fn lazy_load_column_ctx_fires_for_referenced_tables() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.set_schema_nodes(sample_schema());
@@ -4332,7 +4345,7 @@ trailing prose ignored";
 
     #[test]
     fn request_schema_load_dedupes_inflight() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4358,7 +4371,7 @@ trailing prose ignored";
 
     #[test]
     fn refresh_stale_schema_skips_fresh_entries() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_ttl = std::time::Duration::from_secs(300);
@@ -4377,7 +4390,7 @@ trailing prose ignored";
 
     #[test]
     fn refresh_stale_schema_refetches_expired_tables() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_ttl = std::time::Duration::from_millis(1);
@@ -4412,7 +4425,7 @@ trailing prose ignored";
 
     #[test]
     fn refresh_stale_schema_noop_when_ttl_is_zero() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_ttl = std::time::Duration::ZERO;
@@ -4433,7 +4446,7 @@ trailing prose ignored";
 
     #[test]
     fn refresh_schema_busts_timestamps_and_fires_requests() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.active_connection = Some("test_conn".into());
@@ -4488,7 +4501,7 @@ trailing prose ignored";
 
     #[test]
     fn invalidate_for_ddl_databases_fires_databases_load() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4499,7 +4512,7 @@ trailing prose ignored";
 
     #[test]
     fn invalidate_for_ddl_tables_qualified() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4518,7 +4531,7 @@ trailing prose ignored";
 
     #[test]
     fn invalidate_for_ddl_tables_unqualified_fans_out() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4543,7 +4556,7 @@ trailing prose ignored";
 
     #[test]
     fn invalidate_for_ddl_columns_qualified() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4563,7 +4576,7 @@ trailing prose ignored";
 
     #[test]
     fn invalidate_for_ddl_columns_unqualified_fans_across_dbs() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_load_tx = Some(tx);
@@ -4614,7 +4627,7 @@ trailing prose ignored";
 
     #[test]
     fn lazy_load_for_context_honors_ttl() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SchemaLoadRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchemaLoadRequest>(64);
         let state = AppState::new();
         let mut s = state.lock().unwrap();
         s.schema_ttl = std::time::Duration::from_millis(1);

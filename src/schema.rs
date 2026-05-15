@@ -6,6 +6,7 @@
 /// on next access. Both fields are `#[serde(skip)]` so cached trees always
 /// load as "not yet fetched", forcing an initial refresh.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum SchemaNode {
     Database {
         name: String,

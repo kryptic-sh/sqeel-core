@@ -10,6 +10,7 @@
 //! standard double-quote identifier quoting).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DdlEffect {
     /// Database list changed (CREATE/DROP DATABASE/SCHEMA).
     Databases,
