@@ -314,6 +314,29 @@ impl DbConnection {
             .collect())
     }
 
+    /// Fetch columns, indexes, and foreign keys for a table concurrently.
+    /// Uses `tokio::join!` so a failed index/FK query doesn't abort columns.
+    pub async fn list_table_relations(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> (
+        Vec<crate::db::ColumnInfo>,
+        Vec<IndexInfo>,
+        Vec<ForeignKeyInfo>,
+    ) {
+        let (cols, idxs, fks) = tokio::join!(
+            self.list_columns(database, table),
+            self.list_indexes(database, table),
+            self.list_foreign_keys(database, table),
+        );
+        (
+            cols.unwrap_or_default(),
+            idxs.unwrap_or_default(),
+            fks.unwrap_or_default(),
+        )
+    }
+
     pub async fn execute(&self, query: &str) -> anyhow::Result<ExecOutcome> {
         // Non-row statements (INSERT/UPDATE/DELETE/CREATE/DROP/…) go
         // through sqlx's `execute()` so we can surface rows_affected
@@ -611,6 +634,268 @@ impl DbConnection {
         }
     }
 
+    /// Fetch all indexes for the given table.
+    ///
+    /// For MySQL the schema parameter is the database name. For Postgres it is
+    /// the schema name (same convention as `list_columns`).
+    /// SQLite and DuckDB return empty vecs (best-effort; no standard catalog).
+    pub async fn list_indexes(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<IndexInfo>> {
+        match &self.pool {
+            Pool::MySql(p) => {
+                // One row per (index, column) ordered by SEQ_IN_INDEX; GROUP_CONCAT
+                // aggregates columns into a comma-separated string.
+                let rows = sqlx::query(
+                    "SELECT INDEX_NAME, \
+                     GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',') AS cols, \
+                     NON_UNIQUE \
+                     FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                     GROUP BY INDEX_NAME, NON_UNIQUE \
+                     ORDER BY INDEX_NAME",
+                )
+                .bind(database)
+                .bind(table)
+                .fetch_all(p)
+                .await?;
+                Ok(rows
+                    .iter()
+                    .map(|r| {
+                        let name = mysql_string(r, 0);
+                        let cols_raw = mysql_string(r, 1);
+                        let cols: Vec<String> = cols_raw
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        // NON_UNIQUE == 0 → unique
+                        let non_unique: i64 = r.try_get::<i64, _>(2).unwrap_or(1);
+                        IndexInfo {
+                            name,
+                            cols,
+                            unique: non_unique == 0,
+                        }
+                    })
+                    .collect())
+            }
+            Pool::Pg(p) => {
+                let rows = sqlx::query(
+                    "SELECT \
+                       i.relname  AS index_name, \
+                       ix.indisunique AS is_unique, \
+                       a.attname  AS col_name, \
+                       array_position(ix.indkey, a.attnum) AS col_pos \
+                     FROM pg_class t \
+                     JOIN pg_index ix    ON t.oid = ix.indrelid \
+                     JOIN pg_class i     ON i.oid = ix.indexrelid \
+                     JOIN pg_attribute a ON a.attrelid = t.oid \
+                                        AND a.attnum = ANY(ix.indkey) \
+                     JOIN pg_namespace n ON n.oid = t.relnamespace \
+                     WHERE n.nspname = $1 AND t.relname = $2 \
+                     ORDER BY index_name, col_pos",
+                )
+                .bind(database)
+                .bind(table)
+                .fetch_all(p)
+                .await?;
+                // Aggregate by index_name — use a Vec to preserve insertion order.
+                // Each entry: (index_name, is_unique, [(col_pos, col_name), ...])
+                #[allow(clippy::type_complexity)]
+                let mut agg: Vec<(String, bool, Vec<(i32, String)>)> = Vec::new();
+                for r in &rows {
+                    let idx_name: String = r.try_get(0).unwrap_or_default();
+                    let is_unique: bool = r.try_get(1).unwrap_or(false);
+                    let col_name: String = r.try_get(2).unwrap_or_default();
+                    let col_pos: i32 = r.try_get(3).unwrap_or(0);
+                    if let Some(entry) = agg.iter_mut().find(|(n, _, _)| n == &idx_name) {
+                        entry.2.push((col_pos, col_name));
+                    } else {
+                        agg.push((idx_name, is_unique, vec![(col_pos, col_name)]));
+                    }
+                }
+                Ok(agg
+                    .into_iter()
+                    .map(|(name, unique, mut col_pairs)| {
+                        col_pairs.sort_by_key(|(pos, _)| *pos);
+                        let cols = col_pairs.into_iter().map(|(_, c)| c).collect();
+                        IndexInfo { name, cols, unique }
+                    })
+                    .collect())
+            }
+            // SQLite: best-effort via PRAGMA index_list + PRAGMA index_info.
+            Pool::Sqlite(p) => {
+                let safe_table = table.replace('"', "\"\"");
+                let list_rows = sqlx::query(&format!("PRAGMA index_list(\"{safe_table}\")"))
+                    .fetch_all(p)
+                    .await
+                    .unwrap_or_default();
+                let mut infos = Vec::new();
+                for lr in &list_rows {
+                    let idx_name: String = lr.try_get::<String, _>(1).unwrap_or_default();
+                    let unique_int: i64 = lr.try_get::<i64, _>(2).unwrap_or(0);
+                    let safe_idx = idx_name.replace('"', "\"\"");
+                    let col_rows = sqlx::query(&format!("PRAGMA index_info(\"{safe_idx}\")"))
+                        .fetch_all(p)
+                        .await
+                        .unwrap_or_default();
+                    let cols: Vec<String> = col_rows
+                        .iter()
+                        .map(|cr| cr.try_get::<String, _>(2).unwrap_or_default())
+                        .collect();
+                    infos.push(IndexInfo {
+                        name: idx_name,
+                        cols,
+                        unique: unique_int != 0,
+                    });
+                }
+                Ok(infos)
+            }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(_) => {
+                // DuckDB has no standard PRAGMA index catalog; return empty.
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// Fetch all foreign key constraints for the given table.
+    ///
+    /// For MySQL the schema parameter is the database name. For Postgres it is
+    /// the schema name (same convention as `list_columns`).
+    /// SQLite returns constraints via `PRAGMA foreign_key_list`.
+    /// DuckDB returns empty (no FK catalog).
+    pub async fn list_foreign_keys(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<ForeignKeyInfo>> {
+        match &self.pool {
+            Pool::MySql(p) => {
+                let rows = sqlx::query(
+                    "SELECT CONSTRAINT_NAME, COLUMN_NAME, \
+                     REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, ORDINAL_POSITION \
+                     FROM information_schema.KEY_COLUMN_USAGE \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                     AND REFERENCED_TABLE_NAME IS NOT NULL \
+                     ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+                )
+                .bind(database)
+                .bind(table)
+                .fetch_all(p)
+                .await?;
+                // Aggregate by CONSTRAINT_NAME — Vec preserves insertion order.
+                let mut agg: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
+                for r in &rows {
+                    let constraint: String = mysql_string(r, 0);
+                    let col: String = mysql_string(r, 1);
+                    let ref_table: String = mysql_string(r, 2);
+                    let ref_col: String = mysql_string(r, 3);
+                    if let Some(entry) = agg.iter_mut().find(|(n, _, _, _)| n == &constraint) {
+                        entry.2.push(col);
+                        entry.3.push(ref_col);
+                    } else {
+                        agg.push((constraint, ref_table, vec![col], vec![ref_col]));
+                    }
+                }
+                Ok(agg
+                    .into_iter()
+                    .map(|(name, ref_table, cols, ref_cols)| ForeignKeyInfo {
+                        name,
+                        cols,
+                        ref_table,
+                        ref_cols,
+                    })
+                    .collect())
+            }
+            Pool::Pg(p) => {
+                let rows = sqlx::query(
+                    "SELECT \
+                       con.conname AS name, \
+                       a.attname AS col, \
+                       af.attname AS ref_col, \
+                       cl.relname AS ref_table, \
+                       u.ord \
+                     FROM pg_constraint con \
+                     JOIN unnest(con.conkey) WITH ORDINALITY u(attnum, ord) ON TRUE \
+                     JOIN pg_attribute a  ON a.attrelid = con.conrelid \
+                                         AND a.attnum = u.attnum \
+                     JOIN pg_attribute af ON af.attrelid = con.confrelid \
+                                         AND af.attnum = con.confkey[u.ord] \
+                     JOIN pg_class cl     ON cl.oid = con.confrelid \
+                     JOIN pg_class t      ON t.oid = con.conrelid \
+                     JOIN pg_namespace n  ON n.oid = t.relnamespace \
+                     WHERE con.contype = 'f' AND n.nspname = $1 AND t.relname = $2 \
+                     ORDER BY name, u.ord",
+                )
+                .bind(database)
+                .bind(table)
+                .fetch_all(p)
+                .await?;
+                let mut agg: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
+                for r in &rows {
+                    let name: String = r.try_get(0).unwrap_or_default();
+                    let col: String = r.try_get(1).unwrap_or_default();
+                    let ref_col: String = r.try_get(2).unwrap_or_default();
+                    let ref_table: String = r.try_get(3).unwrap_or_default();
+                    if let Some(entry) = agg.iter_mut().find(|(n, _, _, _)| n == &name) {
+                        entry.2.push(col);
+                        entry.3.push(ref_col);
+                    } else {
+                        agg.push((name, ref_table, vec![col], vec![ref_col]));
+                    }
+                }
+                Ok(agg
+                    .into_iter()
+                    .map(|(name, ref_table, cols, ref_cols)| ForeignKeyInfo {
+                        name,
+                        cols,
+                        ref_table,
+                        ref_cols,
+                    })
+                    .collect())
+            }
+            Pool::Sqlite(p) => {
+                // PRAGMA foreign_key_list returns one row per (fk, column).
+                let safe_table = table.replace('"', "\"\"");
+                let rows = sqlx::query(&format!("PRAGMA foreign_key_list(\"{safe_table}\")"))
+                    .fetch_all(p)
+                    .await
+                    .unwrap_or_default();
+                // Columns: id, seq, table, from, to, ...
+                let mut agg: Vec<(i64, String, Vec<String>, Vec<String>)> = Vec::new();
+                for r in &rows {
+                    let id: i64 = r.try_get::<i64, _>(0).unwrap_or(0);
+                    let ref_table: String = r.try_get::<String, _>(2).unwrap_or_default();
+                    let from_col: String = r.try_get::<String, _>(3).unwrap_or_default();
+                    let to_col: String = r.try_get::<String, _>(4).unwrap_or_default();
+                    if let Some(entry) = agg.iter_mut().find(|(i, _, _, _)| *i == id) {
+                        entry.2.push(from_col);
+                        entry.3.push(to_col);
+                    } else {
+                        agg.push((id, ref_table, vec![from_col], vec![to_col]));
+                    }
+                }
+                Ok(agg
+                    .into_iter()
+                    .map(|(id, ref_table, cols, ref_cols)| ForeignKeyInfo {
+                        name: format!("fk_{id}"),
+                        cols,
+                        ref_table,
+                        ref_cols,
+                    })
+                    .collect())
+            }
+            #[cfg(feature = "duckdb")]
+            Pool::DuckDb(_) => {
+                // DuckDB has no FK catalog yet; return empty.
+                Ok(vec![])
+            }
+        }
+    }
+
     /// Load the schema tree: databases + tables only (no columns — too slow to
     /// load eagerly for large schemas). Columns can be loaded on demand later.
     pub async fn load_schema(&self) -> anyhow::Result<Vec<SchemaNode>> {
@@ -623,6 +908,11 @@ impl DbConnection {
                     expanded: false,
                     columns: vec![],
                     columns_loaded_at: None,
+                    indexes: vec![],
+                    foreign_keys: vec![],
+                    relations_loaded_at: None,
+                    indexes_expanded: false,
+                    foreign_keys_expanded: false,
                 })
                 .collect();
             return Ok(vec![SchemaNode::Database {
@@ -644,6 +934,11 @@ impl DbConnection {
                     expanded: false,
                     columns: vec![],
                     columns_loaded_at: None,
+                    indexes: vec![],
+                    foreign_keys: vec![],
+                    relations_loaded_at: None,
+                    indexes_expanded: false,
+                    foreign_keys_expanded: false,
                 })
                 .collect();
             nodes.push(SchemaNode::Database {
@@ -663,6 +958,23 @@ pub struct ColumnInfo {
     pub type_name: String,
     pub nullable: bool,
     pub is_pk: bool,
+}
+
+/// Metadata for a single index on a table.
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub cols: Vec<String>,
+    pub unique: bool,
+}
+
+/// Metadata for a single foreign key constraint on a table.
+#[derive(Debug, Clone)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub cols: Vec<String>,
+    pub ref_table: String,
+    pub ref_cols: Vec<String>,
 }
 
 macro_rules! raw_is_null {

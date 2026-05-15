@@ -633,6 +633,8 @@ impl AppState {
                 SchemaNode::Database { tables, .. } => stack.extend(tables.iter()),
                 SchemaNode::Table { columns, .. } => stack.extend(columns.iter()),
                 SchemaNode::Column { .. } => {}
+                SchemaNode::Index { .. } => {}
+                SchemaNode::ForeignKey { .. } => {}
             }
         }
         ids.sort();
@@ -2268,6 +2270,8 @@ impl AppState {
                 SchemaNode::Database { tables, .. } => stack.extend(tables.iter()),
                 SchemaNode::Table { columns, .. } => stack.extend(columns.iter()),
                 SchemaNode::Column { .. } => {}
+                SchemaNode::Index { .. } => {}
+                SchemaNode::ForeignKey { .. } => {}
             }
         }
         out.sort();
@@ -2707,6 +2711,11 @@ impl AppState {
                             expanded: false,
                             columns: vec![],
                             columns_loaded_at: None,
+                            indexes: vec![],
+                            foreign_keys: vec![],
+                            relations_loaded_at: None,
+                            indexes_expanded: false,
+                            foreign_keys_expanded: false,
                         })
                     })
                     .collect();
@@ -2749,6 +2758,85 @@ impl AppState {
         if changed {
             self.mark_schema_cache_dirty();
         }
+    }
+
+    /// Set columns, indexes, and foreign keys for one specific table at once.
+    /// Sets `columns_loaded_at` and `relations_loaded_at` to `now`.
+    pub fn set_table_relations(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+        columns: Vec<SchemaNode>,
+        indexes: Vec<SchemaNode>,
+        foreign_keys: Vec<SchemaNode>,
+    ) {
+        let mut changed = false;
+        'outer: for node in self.schema_nodes.iter_mut() {
+            if let SchemaNode::Database { name, tables, .. } = node
+                && name == db_name
+            {
+                for table in tables.iter_mut() {
+                    if let SchemaNode::Table {
+                        name,
+                        columns: c,
+                        columns_loaded_at,
+                        indexes: ix,
+                        foreign_keys: fk,
+                        relations_loaded_at,
+                        ..
+                    } = table
+                        && name == table_name
+                    {
+                        *c = columns;
+                        *columns_loaded_at = Some(Instant::now());
+                        *ix = indexes;
+                        *fk = foreign_keys;
+                        *relations_loaded_at = Some(Instant::now());
+                        changed = true;
+                        break 'outer;
+                    }
+                }
+                break;
+            }
+        }
+        if changed {
+            self.mark_schema_cache_dirty();
+        }
+    }
+
+    /// Toggle the Indexes or References subgroup for the table at the current
+    /// schema cursor. Reads the `kind` of the focused item to pick which group.
+    pub fn schema_toggle_subgroup(&mut self, group: crate::schema::SubGroup) {
+        let path = self
+            .schema_items_cache
+            .get(self.schema_cursor)
+            .map(|item| item.node_path.clone());
+        if let Some(path) = path {
+            crate::schema::toggle_subgroup(&mut self.schema_nodes, &path, group);
+            self.rebuild_schema_cache();
+        }
+    }
+
+    /// If the current item is a ForeignKey, jump the cursor to the referenced
+    /// table. Returns `true` if the jump was successful, `false` if the target
+    /// table wasn't found in the visible tree.
+    pub fn schema_fk_jump(&mut self) -> bool {
+        let Some(item) = self.schema_items_cache.get(self.schema_cursor) else {
+            return false;
+        };
+        let crate::schema::SchemaItemKind::ForeignKey { ref_table, .. } = &item.kind else {
+            return false;
+        };
+        let ref_table = ref_table.clone();
+        let items = self.schema_items_cache.clone();
+        if let Some(idx) =
+            crate::schema::fk_jump_target(&items, &items[self.schema_cursor], &ref_table)
+        {
+            self.schema_cursor = idx;
+            self.ensure_schema_cursor_visible();
+            return true;
+        }
+        false
     }
 
     /// Like `set_schema_nodes` but preserves the cursor position and the
@@ -4404,12 +4492,22 @@ trailing prose ignored";
                                 is_pk: false,
                             },
                         ],
+                        indexes: vec![],
+                        foreign_keys: vec![],
+                        relations_loaded_at: None,
+                        indexes_expanded: false,
+                        foreign_keys_expanded: false,
                     },
                     SchemaNode::Table {
                         name: "orders".into(),
                         expanded: false,
                         columns_loaded_at: None,
                         columns: vec![],
+                        indexes: vec![],
+                        foreign_keys: vec![],
+                        relations_loaded_at: None,
+                        indexes_expanded: false,
+                        foreign_keys_expanded: false,
                     },
                 ],
             },
@@ -4848,6 +4946,11 @@ trailing prose ignored";
                     expanded: false,
                     columns_loaded_at: None,
                     columns: vec![],
+                    indexes: vec![],
+                    foreign_keys: vec![],
+                    relations_loaded_at: None,
+                    indexes_expanded: false,
+                    foreign_keys_expanded: false,
                 }],
             },
             SchemaNode::Database {
@@ -4859,6 +4962,11 @@ trailing prose ignored";
                     expanded: false,
                     columns_loaded_at: None,
                     columns: vec![],
+                    indexes: vec![],
+                    foreign_keys: vec![],
+                    relations_loaded_at: None,
+                    indexes_expanded: false,
+                    foreign_keys_expanded: false,
                 }],
             },
         ]);
